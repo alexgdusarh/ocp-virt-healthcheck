@@ -3,3 +3,6 @@ reports/*.json
 kubeconfig*
 .vault_pass
 *.retry
+
+# Internal-use template, not for the public repo
+docs/General_Formal_document_template.docx

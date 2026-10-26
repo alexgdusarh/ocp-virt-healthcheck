@@ -1,0 +1,123 @@
+---
+# Check: HyperConverged CR config sanity (pre-workload)
+#
+# Pure configuration review - no VMs required. Flags genuinely risky
+# non-default settings, not just unusual ones.
+#
+# HCO's OWN defaults (hco.kubevirt.io/v1beta1 - NOT upstream raw
+# KubeVirt's defaults, which differ and must not be used as the
+# baseline here):
+#   liveMigrationConfig: completionTimeoutPerGiB=20, parallelMigrationsPerCluster=5,
+#     parallelOutboundMigrationsPerNode=1, allowAutoConverge=false, allowPostCopy=false
+#   workloadUpdateStrategy: workloadUpdateMethods=[LiveMigrate],
+#     batchEvictionSize=10, batchEvictionInterval=1m0s
+# Most individually-named featureGates from older docs (withHostPassthroughCPU,
+# disableMDevConfiguration, persistentReservation, autoResourceLimits, etc.)
+# are deprecated no-ops in current HCO - not flagged as risky here.
+
+- name: "check_hco_config_sanity | Get HyperConverged CR"
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ k8s_auth_kubeconfig | default(omit) }}"
+    api_token: "{{ k8s_auth_api_token | default(omit) }}"
+    api_version: hco.kubevirt.io/v1beta1
+    kind: HyperConverged
+    name: kubevirt-hyperconverged
+    namespace: "{{ cnv_namespace | default('openshift-cnv') }}"
+  register: _hco_cfg
+  ignore_errors: true
+
+- name: "check_hco_config_sanity | Get Nodes (for CPU model diversity check)"
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ k8s_auth_kubeconfig | default(omit) }}"
+    api_token: "{{ k8s_auth_api_token | default(omit) }}"
+    kind: Node
+  register: _nodes_for_cpu
+  ignore_errors: true
+
+- name: "check_hco_config_sanity | Reset accumulators"
+  ansible.builtin.set_fact:
+    _hco_cfg_problems: []
+
+- name: "check_hco_config_sanity | Extract relevant spec fields"
+  vars:
+    _hco_spec: "{{ (_hco_cfg.resources | default([]) | first | default({})).spec | default({}) }}"
+  ansible.builtin.set_fact:
+    _lm_config: "{{ _hco_spec.liveMigrationConfig | default({}) }}"
+    _wus_methods: "{{ (_hco_spec.workloadUpdateStrategy | default({})).workloadUpdateMethods | default(['LiveMigrate']) }}"
+    _default_cpu_model: "{{ _hco_spec.defaultCPUModel | default('') }}"
+    _permitted_host_devices: "{{ _hco_spec.permittedHostDevices | default({}) }}"
+
+- name: "check_hco_config_sanity | Flag zero migration slots"
+  ansible.builtin.set_fact:
+    _hco_cfg_problems: "{{ _hco_cfg_problems + ['parallelMigrationsPerCluster=0: live migration is effectively DISABLED cluster-wide'] }}"
+  when: (_lm_config.parallelMigrationsPerCluster | default(5) | int) == 0
+
+- name: "check_hco_config_sanity | Flag zero outbound migration slots per node"
+  ansible.builtin.set_fact:
+    _hco_cfg_problems: "{{ _hco_cfg_problems + ['parallelOutboundMigrationsPerNode=0: no node can initiate outbound migrations'] }}"
+  when: (_lm_config.parallelOutboundMigrationsPerNode | default(1) | int) == 0
+
+- name: "check_hco_config_sanity | Flag zero completion timeout"
+  ansible.builtin.set_fact:
+    _hco_cfg_problems: "{{ _hco_cfg_problems + ['completionTimeoutPerGiB=0: migrations will be judged non-convergent almost immediately'] }}"
+  when: (_lm_config.completionTimeoutPerGiB | default(20) | int) == 0
+
+- name: "check_hco_config_sanity | Flag allowWorkloadDisruption without allowPostCopy"
+  ansible.builtin.set_fact:
+    _hco_cfg_problems: "{{ _hco_cfg_problems + ['allowWorkloadDisruption=true with allowPostCopy=false: a non-converging migration will PAUSE the VM instead of being cancelled'] }}"
+  when: >-
+    (_lm_config.allowWorkloadDisruption | default(false))
+    and not (_lm_config.allowPostCopy | default(false))
+
+- name: "check_hco_config_sanity | Flag Evict without LiveMigrate"
+  ansible.builtin.set_fact:
+    _hco_cfg_problems: "{{ _hco_cfg_problems + ['workloadUpdateMethods=[Evict] without LiveMigrate: VMs will be hard-stopped (not migrated) during every KubeVirt component update'] }}"
+  when: >-
+    ('Evict' in _wus_methods) and ('LiveMigrate' not in _wus_methods)
+
+- name: "check_hco_config_sanity | Determine distinct node CPU models"
+  ansible.builtin.set_fact:
+    _node_cpu_models: >-
+      {{
+        _nodes_for_cpu.resources | default([])
+        | map(attribute='metadata.labels')
+        | map('dict2items')
+        | sum(start=[])
+        | selectattr('key', 'match', '^cpu-model.node.kubevirt.io/.*')
+        | map(attribute='key')
+        | map('regex_replace', '^cpu-model.node.kubevirt.io/', '')
+        | unique | list
+      }}
+
+- name: "check_hco_config_sanity | Flag unset defaultCPUModel with heterogeneous node CPUs"
+  ansible.builtin.set_fact:
+    _hco_cfg_problems: "{{ _hco_cfg_problems + ['defaultCPUModel unset (effective default: host-model) with ' ~ (_node_cpu_models | length) ~ ' distinct node CPU models (' ~ (_node_cpu_models | join(',')) ~ '): VMs without an explicit CPU model will be migration-constrained to a subset of nodes'] }}"
+  when: (_default_cpu_model == '') and (_node_cpu_models | length > 1)
+
+- name: "check_hco_config_sanity | Finalize result"
+  ansible.builtin.set_fact:
+    _hco_config_sanity_result:
+      check: check_hco_config_sanity
+      status: >-
+        {{ 'FAIL' if (_hco_cfg_problems | length > 0) else 'PASS' }}
+      message: >-
+        {%- if _hco_cfg_problems | length > 0 -%}
+        {{ _hco_cfg_problems | length }} config issue(s) found: {{ _hco_cfg_problems | join('; ') }}
+        {%- else -%}
+        HyperConverged config sane: live migration enabled, workloadUpdateMethods includes LiveMigrate, {{ 'defaultCPUModel=' ~ _default_cpu_model if _default_cpu_model != '' else 'single/no node CPU model diversity detected' }}
+        {%- endif -%}
+      data:
+        live_migration_config: "{{ _lm_config }}"
+        workload_update_methods: "{{ _wus_methods }}"
+        default_cpu_model: "{{ _default_cpu_model if _default_cpu_model != '' else none }}"
+        node_cpu_models: "{{ _node_cpu_models }}"
+        permitted_host_devices: "{{ _permitted_host_devices }}"
+        problems: "{{ _hco_cfg_problems }}"
+
+- name: "check_hco_config_sanity | Record result"
+  ansible.builtin.set_fact:
+    healthcheck_results: "{{ healthcheck_results + [_hco_config_sanity_result] }}"
+
+- name: "check_hco_config_sanity | Show result"
+  ansible.builtin.debug:
+    var: _hco_config_sanity_result

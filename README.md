@@ -88,6 +88,20 @@ different `KUBECONFIG` — each run produces its own report under `reports/`.
 | 13 | SDN - OVN-Kubernetes health (default CNI) | `oc-commands/13_check_sdn_ovnk.sh` | `roles/check_sdn_ovnk` |
 | 14 | SDN - Cilium health (only when Cilium is the detected CNI) | `oc-commands/14_check_sdn_cilium.sh` | `roles/check_sdn_cilium` |
 | 15 | Storage - NetApp Trident CSI / ONTAP (basic; optional - PASS if not installed) | `oc-commands/15_check_storage_trident.sh` | `roles/check_storage_trident` |
+| 16 | HyperConverged config sanity (pre-workload): liveMigrationConfig, workloadUpdateStrategy, defaultCPUModel vs. node CPU diversity | `oc-commands/16_check_hco_config_sanity.sh` | `roles/check_hco_config_sanity` |
+| 17 | Node readiness for VM scheduling (pre-workload): Ready, cordon, kubevirt.io/schedulable, KVM device, drain taint | `oc-commands/17_check_node_vm_readiness.sh` | `roles/check_node_vm_readiness` |
+
+Checks 16/17 are pre-workload checks: pure configuration/infrastructure
+review that doesn't require any VirtualMachine to exist yet - useful for
+validating a cluster before the first workload lands ("white canvas"
+health check). Check 16 flags HyperConverged CR settings as risky against
+**HCO's own CRD defaults**, not upstream raw KubeVirt's defaults, which
+differ (e.g. HCO defaults `completionTimeoutPerGiB` to 20, not upstream's
+800) - don't "fix" this back to the upstream value. Check 17 checks that
+`kubevirt.io/schedulable=true` (a virt-handler *liveness* heartbeat) is
+corroborated by an actual `devices.kubevirt.io/kvm` allocatable count,
+since the two can diverge (documented upstream gap,
+[kubevirt/kubevirt#8583](https://github.com/kubevirt/kubevirt/issues/8583)).
 
 Checks 13/14 are mutually exclusive in Ansible: `site.yaml`'s `pre_tasks`
 detect the cluster's actual CNI (CiliumNode CRD presence as the primary

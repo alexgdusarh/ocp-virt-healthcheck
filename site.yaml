@@ -107,6 +107,10 @@
       when: detected_sdn == 'Cilium'
     - role: check_storage_trident
       tags: [check_storage_trident]
+    - role: check_hco_config_sanity
+      tags: [check_hco_config_sanity]
+    - role: check_node_vm_readiness
+      tags: [check_node_vm_readiness]
 
   post_tasks:
     - name: Ensure report directory exists

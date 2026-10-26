@@ -1,0 +1,76 @@
+---
+# Check: Node readiness for VM scheduling (pre-workload)
+#
+# "kubevirt.io/schedulable=true" reflects virt-handler LIVENESS (a
+# heartbeat the node-controller refreshes), not proof that KVM is
+# actually usable - there is a documented gap between the two
+# (upstream kubevirt/kubevirt#8583: a node can be labeled schedulable
+# while devices.kubevirt.io/kvm is 0, e.g. hardware virtualization
+# disabled at the hypervisor level). This check verifies the Node
+# Ready condition, cordon state, the schedulable label, the actual
+# KVM allocatable count, AND the kubevirt.io/drain maintenance taint -
+# not trusting any single field alone.
+
+- name: "check_node_vm_readiness | Get Nodes"
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ k8s_auth_kubeconfig | default(omit) }}"
+    api_token: "{{ k8s_auth_api_token | default(omit) }}"
+    kind: Node
+  register: _nodes_vm_readiness
+  ignore_errors: true
+
+- name: "check_node_vm_readiness | Reset accumulators"
+  ansible.builtin.set_fact:
+    _node_readiness_problems: []
+
+- name: "check_node_vm_readiness | Flag nodes not fully ready for VM scheduling"
+  vars:
+    # NOTE: deliberately booleans/lists, never bare "True"/"true" scalar
+    # strings, in vars: - storing a Kubernetes condition/label string
+    # scalar here and comparing it in a later expression silently
+    # coerces it to a real Python bool on this ansible-core version,
+    # breaking == 'True'/'true' string comparisons (see memory notes).
+    _is_ready: "{{ (item.status.conditions | default([]) | selectattr('type', 'equalto', 'Ready') | selectattr('status', 'equalto', 'True') | list | length) > 0 }}"
+    _is_schedulable: "{{ ((item.metadata.labels | default({}))['kubevirt.io/schedulable'] | default('false')) == 'true' }}"
+    _kvm_allocatable: "{{ (item.status.allocatable | default({}))['devices.kubevirt.io/kvm'] | default('0') | int }}"
+    _has_drain_taint: "{{ (item.spec.taints | default([]) | selectattr('key', 'equalto', 'kubevirt.io/drain') | list | length) > 0 }}"
+    _reasons: >-
+      {{
+        ([] if _is_ready else ['NotReady'])
+        + ([] if not (item.spec.unschedulable | default(false)) else ['cordoned'])
+        + ([] if _is_schedulable else ['kubevirt.io/schedulable!=true'])
+        + ([] if (_kvm_allocatable | int) > 0 else ['devices.kubevirt.io/kvm=0'])
+        + ([] if not _has_drain_taint else ['kubevirt.io/drain taint (maintenance in progress)'])
+      }}
+  ansible.builtin.set_fact:
+    _node_readiness_problems: "{{ _node_readiness_problems + [item.metadata.name ~ ': ' ~ (_reasons | join(', '))] }}"
+  loop: "{{ _nodes_vm_readiness.resources | default([]) }}"
+  loop_control:
+    label: "{{ item.metadata.name }}"
+  when: _reasons | length > 0
+
+- name: "check_node_vm_readiness | Finalize result"
+  vars:
+    _total_nodes: "{{ _nodes_vm_readiness.resources | default([]) | length }}"
+  ansible.builtin.set_fact:
+    _node_vm_readiness_result:
+      check: check_node_vm_readiness
+      status: >-
+        {{ 'FAIL' if (_node_readiness_problems | length > 0) else 'PASS' }}
+      message: >-
+        {%- if _node_readiness_problems | length > 0 -%}
+        {{ _node_readiness_problems | length }}/{{ _total_nodes }} node(s) not fully ready for VM scheduling: {{ _node_readiness_problems | join('; ') }}
+        {%- else -%}
+        all {{ _total_nodes }} node(s) Ready, uncordoned, kubevirt.io/schedulable=true, KVM device available, no drain taint
+        {%- endif -%}
+      data:
+        total_nodes: "{{ _total_nodes }}"
+        problems: "{{ _node_readiness_problems }}"
+
+- name: "check_node_vm_readiness | Record result"
+  ansible.builtin.set_fact:
+    healthcheck_results: "{{ healthcheck_results + [_node_vm_readiness_result] }}"
+
+- name: "check_node_vm_readiness | Show result"
+  ansible.builtin.debug:
+    var: _node_vm_readiness_result
