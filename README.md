@@ -78,13 +78,37 @@ different `KUBECONFIG` — each run produces its own report under `reports/`.
 | 12 | Live migration readiness (failed/in-flight VMIMs, non-migratable volumes needing LiveMigrate) | `oc-commands/12_check_live_migration.sh` | `roles/check_live_migration` |
 | 13 | SDN - OVN-Kubernetes health (default CNI) | `oc-commands/13_check_sdn_ovnk.sh` | `roles/check_sdn_ovnk` |
 | 14 | SDN - Cilium health (only when Cilium is the detected CNI) | `oc-commands/14_check_sdn_cilium.sh` | `roles/check_sdn_cilium` |
+| 15 | Storage - NetApp Trident CSI / ONTAP (basic; optional - PASS if not installed) | `oc-commands/15_check_storage_trident.sh` | `roles/check_storage_trident` |
 
 Checks 13/14 are mutually exclusive in Ansible: `site.yaml`'s `pre_tasks`
-detect the cluster's actual CNI (`Network.config.openshift.io/cluster`
-`spec.networkType`) once as `detected_sdn`, and each role's `when:` runs
-only the one that matches — no flag needed. The two `oc` scripts are
-separate per-CNI files; open whichever matches what's actually installed
-on the cluster you're looking at.
+detect the cluster's actual CNI (CiliumNode CRD presence as the primary
+signal, `Network.config.openshift.io/cluster` `spec.networkType` as a
+fallback) once as `detected_sdn`, and each role's `when:` runs only the
+one that matches — no flag needed. The two `oc` scripts are separate
+per-CNI files; open whichever matches what's actually installed on the
+cluster you're looking at.
+
+**Scope note on third-party components** (Cilium, Trident/ONTAP, and any
+future non-Red-Hat component): these checks cover how the component
+interacts with OpenShift/OCP-Virt (installed? reporting healthy? can
+VMs actually use it?) — not a deep dive into the vendor's own internals,
+which is that vendor's own support surface. Red Hat-native components
+(CNV, OVN-Kubernetes, MCO, etc.) get full diagnostic depth; third-party
+components get a basic presence + health check.
+
+Check 15 known-issues references (NetApp Trident + OpenShift
+Virtualization), gathered 2026-10-26 — see
+[`docs/trident-known-issues.md`](docs/trident-known-issues.md) for the
+full list with links. Headline items: `TridentBackend.state: online` is
+a documented false-positive risk
+([NetApp/trident#543](https://github.com/NetApp/trident/issues/543),
+[#836](https://github.com/NetApp/trident/issues/836)); SAN-protocol
+StorageClasses (`ontap-san`/`ontap-san-economy`) only support RWX
+(required for live migration) when `volumeMode: Block`, not
+`Filesystem`; iSCSI session recovery after node reboot has open upstream
+bugs ([#1138](https://github.com/NetApp/trident/issues/1138),
+[#998](https://github.com/NetApp/trident/issues/998)) that are
+particularly relevant since OCP nodes reboot during upgrades.
 
 ## License
 

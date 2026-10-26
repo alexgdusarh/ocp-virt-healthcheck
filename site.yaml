@@ -105,6 +105,8 @@
     - role: check_sdn_cilium
       tags: [check_sdn_cilium]
       when: detected_sdn == 'Cilium'
+    - role: check_storage_trident
+      tags: [check_storage_trident]
 
   post_tasks:
     - name: Ensure report directory exists

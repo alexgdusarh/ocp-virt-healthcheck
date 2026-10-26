@@ -1,0 +1,211 @@
+---
+# Check: Storage - NetApp Trident CSI / ONTAP (basic)
+#
+# Scope note: Trident/ONTAP is a third-party component. This check
+# covers how it interacts with OpenShift/OCP-Virt (installed? healthy?
+# can VMs provision/migrate on it?) - not a deep dive into Trident/
+# ONTAP internals, which is NetApp's own support surface.
+#
+# Optional by design: PASS with an informational message if the
+# TridentOrchestrator CRD isn't present (most clusters don't use
+# Trident), matching the pattern used for MachineSets/BareMetalHosts/
+# NMState elsewhere in this playbook.
+#
+# NOTE (from research, 2026-10-26): TridentBackend.state/online is a
+# known false-positive risk - NetApp/trident GitHub issues #543 and
+# #836 document backends/volumes sometimes reporting healthy when
+# they are not fully functional. This check surfaces the field as
+# reported; it is a strong signal, not proof of full functionality.
+
+- name: "check_storage_trident | Check for TridentOrchestrator CRD (presence)"
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ k8s_auth_kubeconfig | default(omit) }}"
+    api_token: "{{ k8s_auth_api_token | default(omit) }}"
+    api_version: apiextensions.k8s.io/v1
+    kind: CustomResourceDefinition
+    name: tridentorchestrators.trident.netapp.io
+  register: _trident_crd
+  ignore_errors: true
+
+- name: "check_storage_trident | Trident not installed - record PASS and skip"
+  when: (_trident_crd.failed | default(false)) or (_trident_crd.resources | default([]) | length == 0)
+  block:
+    - name: "check_storage_trident | Record not-installed result"
+      ansible.builtin.set_fact:
+        _storage_trident_result:
+          check: check_storage_trident
+          status: PASS
+          message: "Trident CRDs not present - Trident is not installed on this cluster"
+          data: {}
+
+    - name: "check_storage_trident | Append and show not-installed result"
+      ansible.builtin.set_fact:
+        healthcheck_results: "{{ healthcheck_results + [_storage_trident_result] }}"
+
+    - name: "check_storage_trident | Show not-installed result"
+      ansible.builtin.debug:
+        var: _storage_trident_result
+
+- name: "check_storage_trident | Trident is present - run real checks"
+  when: not ((_trident_crd.failed | default(false)) or (_trident_crd.resources | default([]) | length == 0))
+  block:
+    - name: "check_storage_trident | Get TridentOrchestrator"
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ k8s_auth_kubeconfig | default(omit) }}"
+        api_token: "{{ k8s_auth_api_token | default(omit) }}"
+        api_version: trident.netapp.io/v1
+        kind: TridentOrchestrator
+      register: _torc
+      ignore_errors: true
+
+    - name: "check_storage_trident | Get trident-controller Deployment"
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ k8s_auth_kubeconfig | default(omit) }}"
+        api_token: "{{ k8s_auth_api_token | default(omit) }}"
+        api_version: apps/v1
+        kind: Deployment
+        name: trident-controller
+        namespace: "{{ trident_namespace | default('trident') }}"
+      register: _trident_controller
+      ignore_errors: true
+
+    - name: "check_storage_trident | Get trident-csi DaemonSet"
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ k8s_auth_kubeconfig | default(omit) }}"
+        api_token: "{{ k8s_auth_api_token | default(omit) }}"
+        api_version: apps/v1
+        kind: DaemonSet
+        name: trident-csi
+        namespace: "{{ trident_namespace | default('trident') }}"
+      register: _trident_csi_ds
+      ignore_errors: true
+
+    - name: "check_storage_trident | Get TridentBackends"
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ k8s_auth_kubeconfig | default(omit) }}"
+        api_token: "{{ k8s_auth_api_token | default(omit) }}"
+        api_version: trident.netapp.io/v1
+        kind: TridentBackend
+        namespace: "{{ trident_namespace | default('trident') }}"
+      register: _tridentbackends
+      ignore_errors: true
+
+    - name: "check_storage_trident | Get TridentBackendConfigs"
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ k8s_auth_kubeconfig | default(omit) }}"
+        api_token: "{{ k8s_auth_api_token | default(omit) }}"
+        api_version: trident.netapp.io/v1
+        kind: TridentBackendConfig
+      register: _tridentbackendconfigs
+      ignore_errors: true
+
+    - name: "check_storage_trident | Get StorageClasses using the Trident provisioner"
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ k8s_auth_kubeconfig | default(omit) }}"
+        api_token: "{{ k8s_auth_api_token | default(omit) }}"
+        api_version: storage.k8s.io/v1
+        kind: StorageClass
+      register: _all_storageclasses
+      ignore_errors: true
+
+    - name: "check_storage_trident | Reset accumulators"
+      ansible.builtin.set_fact:
+        _trident_problems: []
+        _trident_san_filesystem_scs: []
+
+    - name: "check_storage_trident | Evaluate TridentOrchestrator status"
+      vars:
+        _torc_item: "{{ (_torc.resources | default([])) | first | default({}) }}"
+      ansible.builtin.set_fact:
+        _torc_status: "{{ (_torc_item.status | default({})).status | default('NotFound') }}"
+        _torc_version: "{{ (_torc_item.status | default({})).version | default('unknown') }}"
+
+    - name: "check_storage_trident | Flag TridentOrchestrator not Installed"
+      ansible.builtin.set_fact:
+        _trident_problems: "{{ _trident_problems + ['TridentOrchestrator status=' ~ _torc_status] }}"
+      when: _torc_status != 'Installed'
+
+    - name: "check_storage_trident | Evaluate controller/node readiness"
+      vars:
+        _controller: "{{ (_trident_controller.resources | default([])) | first | default({}) }}"
+        _node_ds: "{{ (_trident_csi_ds.resources | default([])) | first | default({}) }}"
+      ansible.builtin.set_fact:
+        _controller_desired: "{{ (_controller.spec | default({})).replicas | default(0) }}"
+        _controller_ready: "{{ (_controller.status | default({})).readyReplicas | default(0) }}"
+        _node_ds_desired: "{{ (_node_ds.status | default({})).desiredNumberScheduled | default(0) }}"
+        _node_ds_ready: "{{ (_node_ds.status | default({})).numberReady | default(0) }}"
+
+    - name: "check_storage_trident | Flag controller/node readiness problems"
+      ansible.builtin.set_fact:
+        _trident_problems: "{{ _trident_problems + ['trident-controller ' ~ _controller_ready ~ '/' ~ _controller_desired ~ ' ready'] }}"
+      when: (_controller_desired | int) != (_controller_ready | int)
+
+    - name: "check_storage_trident | Flag node DaemonSet readiness problems"
+      ansible.builtin.set_fact:
+        _trident_problems: "{{ _trident_problems + ['trident-csi ' ~ _node_ds_ready ~ '/' ~ _node_ds_desired ~ ' ready'] }}"
+      when: (_node_ds_desired | int) != (_node_ds_ready | int)
+
+    - name: "check_storage_trident | Flag TridentBackends not online"
+      ansible.builtin.set_fact:
+        _trident_problems: "{{ _trident_problems + [(item.backendName | default(item.metadata.name)) ~ ' state=' ~ (item.state | default('Unknown'))] }}"
+      loop: "{{ _tridentbackends.resources | default([]) }}"
+      loop_control:
+        label: "{{ item.metadata.name }}"
+      when: (item.state | default('')) != 'online'
+
+    - name: "check_storage_trident | Flag TridentBackendConfigs not Success"
+      ansible.builtin.set_fact:
+        _trident_problems: "{{ _trident_problems + [item.metadata.name ~ ' lastOperationStatus=' ~ ((item.status | default({})).lastOperationStatus | default('Unknown'))] }}"
+      loop: "{{ _tridentbackendconfigs.resources | default([]) }}"
+      loop_control:
+        label: "{{ item.metadata.name }}"
+      when: ((item.status | default({})).lastOperationStatus | default('')) != 'Success'
+
+    - name: "check_storage_trident | Flag SAN-protocol StorageClasses with volumeMode left as Filesystem (RWX/live-migration gotcha)"
+      # ontap-san/ontap-san-economy only support RWX when volumeMode is
+      # Block; Kubernetes accepts a Filesystem-mode StorageClass/PVC
+      # with ReadWriteMany anyway, but it will not actually support
+      # live migration correctly. volumeMode lives on the PVC, not the
+      # StorageClass, so this only flags the StorageClass as worth
+      # checking - it cannot see every PVC's actual volumeMode here
+      # without a cluster-wide PVC scan, which is out of scope for a
+      # basic third-party check.
+      ansible.builtin.set_fact:
+        _trident_san_filesystem_scs: "{{ _trident_san_filesystem_scs + [item.metadata.name] }}"
+      loop: "{{ _all_storageclasses.resources | default([]) }}"
+      loop_control:
+        label: "{{ item.metadata.name }}"
+      when: >-
+        item.provisioner == 'csi.trident.netapp.io'
+        and ((item.parameters | default({})).backendType | default('') is match('.*san.*'))
+
+    - name: "check_storage_trident | Finalize result"
+      ansible.builtin.set_fact:
+        _storage_trident_result:
+          check: check_storage_trident
+          status: >-
+            {{ 'FAIL' if (_trident_problems | length > 0) else 'PASS' }}
+          message: >-
+            {%- if _trident_problems | length > 0 -%}
+            {{ _trident_problems | length }} problem(s) found: {{ _trident_problems | join('; ') }}
+            {%- else -%}
+            Trident {{ _torc_version }} healthy: controller {{ _controller_ready }}/{{ _controller_desired }}, node DaemonSet {{ _node_ds_ready }}/{{ _node_ds_desired }}, all backends online
+            {%- endif -%}
+            {{ ' NOTE: ' ~ (_trident_san_filesystem_scs | length) ~ ' SAN-backed StorageClass(es) found (' ~ (_trident_san_filesystem_scs | join(',')) ~ ') - verify any RWX PVCs on these use volumeMode=Block for live migration to work (ontap-san/ontap-san-economy do not support RWX in Filesystem mode)' if _trident_san_filesystem_scs | length > 0 else '' }}
+          data:
+            torc_status: "{{ _torc_status }}"
+            torc_version: "{{ _torc_version }}"
+            controller_ready: "{{ _controller_ready }}"
+            controller_desired: "{{ _controller_desired }}"
+            node_ds_ready: "{{ _node_ds_ready }}"
+            node_ds_desired: "{{ _node_ds_desired }}"
+            problems: "{{ _trident_problems }}"
+            san_storageclasses_to_verify: "{{ _trident_san_filesystem_scs }}"
+
+    - name: "check_storage_trident | Append result"
+      ansible.builtin.set_fact:
+        healthcheck_results: "{{ healthcheck_results + [_storage_trident_result] }}"
+
+    - name: "check_storage_trident | Show result"
+      ansible.builtin.debug:
+        var: _storage_trident_result
