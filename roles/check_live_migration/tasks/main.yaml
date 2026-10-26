@@ -1,0 +1,107 @@
+---
+# Check: Live migration readiness
+#
+# FAILs only on a genuinely Failed VirtualMachineInstanceMigration, or
+# a running VMI whose evictionStrategy requires LiveMigrate while it
+# uses a non-migratable volume type (hostDisk, or a PVC whose name
+# suggests local/node-pinned storage) - that combination means the
+# VMI cannot actually be evicted when needed. In-flight migrations
+# (Pending/Scheduling/Running/etc) are reported informationally, not
+# treated as a failure - a migration in progress is normal.
+
+- name: "check_live_migration | Get VirtualMachineInstanceMigrations (all namespaces)"
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ k8s_auth_kubeconfig | default(omit) }}"
+    api_token: "{{ k8s_auth_api_token | default(omit) }}"
+    api_version: kubevirt.io/v1
+    kind: VirtualMachineInstanceMigration
+  register: _vmims
+  ignore_errors: true
+
+- name: "check_live_migration | Get VirtualMachineInstances (all namespaces)"
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ k8s_auth_kubeconfig | default(omit) }}"
+    api_token: "{{ k8s_auth_api_token | default(omit) }}"
+    api_version: kubevirt.io/v1
+    kind: VirtualMachineInstance
+  register: _vmis_mig
+  ignore_errors: true
+
+- name: "check_live_migration | Reset accumulators"
+  ansible.builtin.set_fact:
+    _failed_migrations: []
+    _inflight_migrations: []
+    _non_migratable_vmis: []
+
+- name: "check_live_migration | Flag Failed migrations"
+  ansible.builtin.set_fact:
+    _failed_migrations: "{{ _failed_migrations + [item.metadata.namespace ~ '/' ~ item.metadata.name ~ ' (vmi=' ~ (item.spec.vmiName | default('unknown')) ~ ')'] }}"
+  loop: "{{ _vmims.resources | default([]) }}"
+  loop_control:
+    label: "{{ item.metadata.name }}"
+  when: (item.status.phase | default('')) == 'Failed'
+
+- name: "check_live_migration | List in-flight migrations (informational)"
+  ansible.builtin.set_fact:
+    _inflight_migrations: "{{ _inflight_migrations + [item.metadata.namespace ~ '/' ~ item.metadata.name ~ ' (vmi=' ~ (item.spec.vmiName | default('unknown')) ~ ', phase=' ~ (item.status.phase | default('Unknown')) ~ ')'] }}"
+  loop: "{{ _vmims.resources | default([]) }}"
+  loop_control:
+    label: "{{ item.metadata.name }}"
+  when: (item.status.phase | default('')) not in ['Succeeded', 'Failed']
+
+- name: "check_live_migration | Flag running VMIs needing LiveMigrate eviction but using a non-migratable volume"
+  vars:
+    _eviction_strategy: "{{ item.spec.evictionStrategy | default('LiveMigrate') }}"
+    _non_migratable_volumes: >-
+      {{
+        (item.spec.volumes | default([]))
+        | selectattr('hostDisk', 'defined')
+        | map(attribute='name')
+        | list
+        +
+        (item.spec.volumes | default([])
+          | selectattr('persistentVolumeClaim', 'defined')
+          | selectattr('persistentVolumeClaim.claimName', 'search', 'local')
+          | map(attribute='name') | list)
+      }}
+  ansible.builtin.set_fact:
+    _non_migratable_vmis: "{{ _non_migratable_vmis + [item.metadata.namespace ~ '/' ~ item.metadata.name ~ ' (evictionStrategy=' ~ _eviction_strategy ~ ', non-migratable volumes: ' ~ (_non_migratable_volumes | join(',')) ~ ')'] }}"
+  loop: "{{ _vmis_mig.resources | default([]) }}"
+  loop_control:
+    label: "{{ item.metadata.name }}"
+  when: >-
+    (item.status.phase | default('')) == 'Running'
+    and _eviction_strategy == 'LiveMigrate'
+    and _non_migratable_volumes | length > 0
+
+- name: "check_live_migration | Finalize result"
+  vars:
+    _total_problems: "{{ (_failed_migrations | length | int) + (_non_migratable_vmis | length | int) }}"
+  ansible.builtin.set_fact:
+    _live_migration_result:
+      check: check_live_migration
+      status: >-
+        {{
+          'FAIL' if (_total_problems | int > 0) else
+          'PASS'
+        }}
+      message: >-
+        {%- if _total_problems | int > 0 -%}
+        {{ _total_problems }} problem(s) found
+        {%- if _failed_migrations | length > 0 %}; Failed migrations: {{ _failed_migrations | join('; ') }}{% endif %}
+        {%- if _non_migratable_vmis | length > 0 %}; VMIs needing LiveMigrate but non-migratable: {{ _non_migratable_vmis | join('; ') }}{% endif %}
+        {%- else -%}
+        no Failed migrations, no running VMI requires LiveMigrate eviction while using non-migratable storage{{ (' (' ~ (_inflight_migrations | length) ~ ' migration(s) currently in-flight)') if _inflight_migrations | length > 0 else '' }}
+        {%- endif -%}
+      data:
+        failed_migrations: "{{ _failed_migrations }}"
+        inflight_migrations: "{{ _inflight_migrations }}"
+        non_migratable_vmis: "{{ _non_migratable_vmis }}"
+
+- name: "check_live_migration | Record result"
+  ansible.builtin.set_fact:
+    healthcheck_results: "{{ healthcheck_results + [_live_migration_result] }}"
+
+- name: "check_live_migration | Show result"
+  ansible.builtin.debug:
+    var: _live_migration_result

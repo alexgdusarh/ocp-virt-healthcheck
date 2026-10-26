@@ -1,0 +1,94 @@
+---
+# Check: VirtualMachine / VirtualMachineInstance health
+#
+# A VirtualMachine is healthy if printableStatus is "Running" or
+# "Stopped" (both are valid steady states - a deliberately stopped VM
+# is not a failure). Anything else (Starting, Stopping, Migrating,
+# CrashLoopBackOff, ErrorUnschedulable, etc. held outside those two
+# steady states) is flagged.
+#
+# A VirtualMachineInstance is only healthy if phase == Running AND its
+# Ready condition == True.
+
+- name: "check_vm_health | Get VirtualMachines (all namespaces)"
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ k8s_auth_kubeconfig | default(omit) }}"
+    api_token: "{{ k8s_auth_api_token | default(omit) }}"
+    api_version: kubevirt.io/v1
+    kind: VirtualMachine
+  register: _vms
+  ignore_errors: true
+
+- name: "check_vm_health | Get VirtualMachineInstances (all namespaces)"
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ k8s_auth_kubeconfig | default(omit) }}"
+    api_token: "{{ k8s_auth_api_token | default(omit) }}"
+    api_version: kubevirt.io/v1
+    kind: VirtualMachineInstance
+  register: _vmis
+  ignore_errors: true
+
+- name: "check_vm_health | Reset accumulators"
+  ansible.builtin.set_fact:
+    _vm_problems: []
+    _vmi_problems: []
+
+- name: "check_vm_health | Flag VirtualMachines outside Running/Stopped"
+  ansible.builtin.set_fact:
+    _vm_problems: "{{ _vm_problems + [item.metadata.namespace ~ '/' ~ item.metadata.name ~ ' (status=' ~ (item.status.printableStatus | default('Unknown')) ~ ')'] }}"
+  loop: "{{ _vms.resources | default([]) }}"
+  loop_control:
+    label: "{{ item.metadata.name }}"
+  when: (item.status.printableStatus | default('Unknown')) not in ['Running', 'Stopped']
+
+- name: "check_vm_health | Flag VirtualMachineInstances not Running/Ready"
+  vars:
+    # NOTE: _ready_status must stay a list (not be reduced to a bare
+    # scalar) because storing a scalar "True"/"False" string in vars:
+    # round-trips it through Ansible's native-type casting and silently
+    # turns it into a real Python bool, breaking later != 'True' string
+    # comparisons. A non-empty/empty list has no such ambiguity.
+    _ready_true: "{{ item.status.conditions | default([]) | selectattr('type', 'equalto', 'Ready') | selectattr('status', 'equalto', 'True') | list }}"
+  ansible.builtin.set_fact:
+    _vmi_problems: "{{ _vmi_problems + [item.metadata.namespace ~ '/' ~ item.metadata.name ~ ' (phase=' ~ (item.status.phase | default('Unknown')) ~ ' ready=' ~ (_ready_true | length > 0) ~ ')'] }}"
+  loop: "{{ _vmis.resources | default([]) }}"
+  loop_control:
+    label: "{{ item.metadata.name }}"
+  when: (item.status.phase | default('Unknown')) != 'Running' or _ready_true | length == 0
+
+- name: "check_vm_health | Finalize result"
+  vars:
+    _vm_count: "{{ _vms.resources | default([]) | length | int }}"
+    _vmi_count: "{{ _vmis.resources | default([]) | length | int }}"
+    _problem_count: "{{ (_vm_problems | length | int) + (_vmi_problems | length | int) }}"
+  ansible.builtin.set_fact:
+    _vm_health_result:
+      check: check_vm_health
+      status: >-
+        {{
+          'FAIL' if (_problem_count | int > 0) else
+          'PASS'
+        }}
+      message: >-
+        {%- if (_vm_count | int) == 0 -%}
+        No VirtualMachines found in this cluster
+        {%- elif _problem_count | int > 0 -%}
+        {{ _problem_count }} problem(s) found
+        {%- if _vm_problems | length > 0 %}; VMs not Running/Stopped: {{ _vm_problems | join('; ') }}{% endif %}
+        {%- if _vmi_problems | length > 0 %}; VMIs not Running/Ready: {{ _vmi_problems | join('; ') }}{% endif %}
+        {%- else -%}
+        all {{ _vm_count }} VirtualMachine(s) Running/Stopped, all {{ _vmi_count }} VirtualMachineInstance(s) Running/Ready
+        {%- endif -%}
+      data:
+        vm_count: "{{ _vm_count }}"
+        vmi_count: "{{ _vmi_count }}"
+        vm_problems: "{{ _vm_problems }}"
+        vmi_problems: "{{ _vmi_problems }}"
+
+- name: "check_vm_health | Record result"
+  ansible.builtin.set_fact:
+    healthcheck_results: "{{ healthcheck_results + [_vm_health_result] }}"
+
+- name: "check_vm_health | Show result"
+  ansible.builtin.debug:
+    var: _vm_health_result

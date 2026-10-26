@@ -1,0 +1,279 @@
+---
+# Check: VM networking
+#
+# Covers: NMState operator status (optional), NodeNetworkConfigurationPolicy
+# (NNCP) conditions, physical NIC name/count consistency across nodes of
+# the same role (via "oc debug node/<node> -- chroot /host nmcli ..." -
+# the one deliberate exception to not shelling out to oc, since
+# reimplementing oc debug's privileged-pod lifecycle in raw k8s API
+# calls would be more fragile than using the tool built for this),
+# dedicated/secondary networks declared in NNCPs, NetworkAttachmentDefinition
+# presence and VMI-reference resolution, and a VLAN cross-check between
+# NNCP-configured VLANs and NAD-referenced VLANs.
+#
+# NMState/NNCP are optional - many clusters configure secondary
+# networking without the NMState operator - absence is reported, not
+# treated as a failure on its own.
+
+- name: "check_vm_networking | Get NMState operator CSV"
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ k8s_auth_kubeconfig | default(omit) }}"
+    api_token: "{{ k8s_auth_api_token | default(omit) }}"
+    api_version: operators.coreos.com/v1alpha1
+    kind: ClusterServiceVersion
+  register: _all_csvs
+  ignore_errors: true
+
+- name: "check_vm_networking | Get NodeNetworkConfigurationPolicies"
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ k8s_auth_kubeconfig | default(omit) }}"
+    api_token: "{{ k8s_auth_api_token | default(omit) }}"
+    api_version: nmstate.io/v1
+    kind: NodeNetworkConfigurationPolicy
+  register: _nncp
+  ignore_errors: true
+
+- name: "check_vm_networking | Get NetworkAttachmentDefinitions (all namespaces)"
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ k8s_auth_kubeconfig | default(omit) }}"
+    api_token: "{{ k8s_auth_api_token | default(omit) }}"
+    api_version: k8s.cni.cncf.io/v1
+    kind: NetworkAttachmentDefinition
+  register: _nads
+  ignore_errors: true
+
+- name: "check_vm_networking | Get VirtualMachineInstances (all namespaces)"
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ k8s_auth_kubeconfig | default(omit) }}"
+    api_token: "{{ k8s_auth_api_token | default(omit) }}"
+    api_version: kubevirt.io/v1
+    kind: VirtualMachineInstance
+  register: _vmis_net
+  ignore_errors: true
+
+- name: "check_vm_networking | Get Nodes (for physical NIC consistency)"
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ k8s_auth_kubeconfig | default(omit) }}"
+    api_token: "{{ k8s_auth_api_token | default(omit) }}"
+    kind: Node
+  register: _nodes_for_nic
+  ignore_errors: true
+
+- name: "check_vm_networking | Reset accumulators"
+  ansible.builtin.set_fact:
+    _nad_existing_refs: []
+    _vmis_annotated: []
+    _vmi_missing_nad_refs: []
+    _nncp_problems: []
+    _node_nics: []
+    _nic_signature_counts: {}
+    _nic_mismatch_nodes: []
+
+# --- 1. NMState operator ------------------------------------------------
+
+- name: "check_vm_networking | Find NMState operator CSV"
+  ansible.builtin.set_fact:
+    _nmstate_csv: >-
+      {{
+        (_all_csvs.resources | default([]))
+        | selectattr('metadata.name', 'match', '^kubernetes-nmstate-operator.*')
+        | list | first | default({})
+      }}
+
+# --- 2. NodeNetworkConfigurationPolicy ----------------------------------
+
+- name: "check_vm_networking | Flag NNCPs not Available/Degraded=True"
+  ansible.builtin.set_fact:
+    _nncp_problems: "{{ _nncp_problems + [item.metadata.name] }}"
+  loop: "{{ _nncp.resources | default([]) }}"
+  loop_control:
+    label: "{{ item.metadata.name }}"
+  when: >-
+    (item.status.conditions | default([]) | selectattr('type', 'equalto', 'Available') | selectattr('status', 'equalto', 'True') | list | length) == 0
+    or (item.status.conditions | default([]) | selectattr('type', 'equalto', 'Degraded') | selectattr('status', 'equalto', 'True') | list | length) > 0
+
+# --- 3. Physical NIC consistency across nodes of the same role ---------
+
+- name: "check_vm_networking | Get physical NIC list per node (oc debug + nmcli)"
+  ansible.builtin.command:
+    cmd: >-
+      oc debug node/{{ item.metadata.name }} --quiet
+      -- chroot /host nmcli -t -f DEVICE,TYPE,STATE device status
+  environment: "{{ {'KUBECONFIG': k8s_auth_kubeconfig} if (k8s_auth_kubeconfig is defined and k8s_auth_kubeconfig) else {} }}"
+  loop: "{{ _nodes_for_nic.resources | default([]) }}"
+  loop_control:
+    label: "{{ item.metadata.name }}"
+  register: _nic_raw
+  changed_when: false
+  ignore_errors: true
+
+- name: "check_vm_networking | Parse physical NIC names and role per node"
+  vars:
+    _eth_lines: "{{ item.stdout_lines | default([]) | select('search', ':ethernet:') | list }}"
+    _nic_names: "{{ _eth_lines | map('regex_replace', '^([^:]+):.*$', '\\1') | list | sort }}"
+    _node_labels: "{{ item.item.metadata.labels | default({}) }}"
+    _node_role: >-
+      {{
+        'worker' if 'node-role.kubernetes.io/worker' in _node_labels else
+        'master' if 'node-role.kubernetes.io/master' in _node_labels else
+        'other'
+      }}
+  ansible.builtin.set_fact:
+    _node_nics: "{{ _node_nics + [{'node': item.item.metadata.name, 'role': _node_role, 'nics': _nic_names, 'debug_failed': (item.rc | default(1)) != 0}] }}"
+  loop: "{{ _nic_raw.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item.metadata.name }}"
+
+- name: "check_vm_networking | Count occurrences of each role::nic-signature pair"
+  vars:
+    _sig: "{{ item.role ~ '::' ~ (item.nics | join(',')) }}"
+  ansible.builtin.set_fact:
+    _nic_signature_counts: "{{ _nic_signature_counts | combine({_sig: (_nic_signature_counts[_sig] | default(0) | int) + 1}) }}"
+  loop: "{{ _node_nics | rejectattr('debug_failed', 'equalto', true) | list }}"
+  loop_control:
+    label: "{{ item.node }}"
+
+- name: "check_vm_networking | Determine the most common NIC signature per role"
+  vars:
+    _candidates: "{{ _nic_signature_counts | dict2items | selectattr('key', 'match', '^' ~ item ~ '::') | list }}"
+    _best_sig: "{{ (_candidates | sort(attribute='value', reverse=true) | first).key | regex_replace('^' ~ item ~ '::', '') }}"
+  ansible.builtin.set_fact:
+    _reference_sig_by_role: "{{ _reference_sig_by_role | default({}) | combine({item: _best_sig}) }}"
+  loop: "{{ _node_nics | rejectattr('debug_failed', 'equalto', true) | map(attribute='role') | unique | list }}"
+  loop_control:
+    label: "{{ item }}"
+
+- name: "check_vm_networking | Flag nodes whose NIC set differs from their role's reference, or whose debug failed"
+  vars:
+    _my_sig: "{{ item.nics | join(',') }}"
+    _ref_sig: "{{ (_reference_sig_by_role | default({}))[item.role] | default('') }}"
+  ansible.builtin.set_fact:
+    _nic_mismatch_nodes: >-
+      {{
+        _nic_mismatch_nodes + [
+          item.node ~ (
+            ' (oc debug failed - could not read NICs)' if item.debug_failed else
+            ' (nics=' ~ _my_sig ~ ', role ' ~ item.role ~ ' reference=' ~ _ref_sig ~ ')'
+          )
+        ]
+      }}
+  loop: "{{ _node_nics }}"
+  loop_control:
+    label: "{{ item.node }}"
+  when: item.debug_failed or _my_sig != _ref_sig
+
+# --- 4. Dedicated/secondary networks (NNCP interfaces, excluding br-ex) -
+
+- name: "check_vm_networking | Reset dedicated-network accumulator"
+  ansible.builtin.set_fact:
+    _dedicated_networks: []
+
+- name: "check_vm_networking | List NNCP-declared dedicated (non-br-ex) interfaces"
+  ansible.builtin.set_fact:
+    _dedicated_networks: "{{ _dedicated_networks + [{'policy': item.0.metadata.name, 'interface': item.1.name, 'type': (item.1.type | default('unknown')), 'vlan': (item.1.vlan.id | default(none))}] }}"
+  loop: "{{ (_nncp.resources | default([])) | subelements('spec.desiredState.interfaces', skip_missing=True) }}"
+  loop_control:
+    label: "{{ item.0.metadata.name }}/{{ item.1.name }}"
+  when: item.1.name != 'br-ex'
+
+# --- 5. NetworkAttachmentDefinitions + VMI reference resolution --------
+
+- name: "check_vm_networking | Build set of existing NAD namespace/name references"
+  ansible.builtin.set_fact:
+    _nad_existing_refs: "{{ _nad_existing_refs + [item.metadata.namespace ~ '/' ~ item.metadata.name] }}"
+  loop: "{{ _nads.resources | default([]) }}"
+  loop_control:
+    label: "{{ item.metadata.name }}"
+
+- name: "check_vm_networking | Annotate each VMI with its multus networks (for subelements)"
+  ansible.builtin.set_fact:
+    _vmis_annotated: "{{ _vmis_annotated + [item | combine({'_multus_networks': (item.spec.networks | default([]) | selectattr('multus', 'defined') | list)})] }}"
+  loop: "{{ _vmis_net.resources | default([]) }}"
+  loop_control:
+    label: "{{ item.metadata.name }}"
+
+- name: "check_vm_networking | Flag VMI network references with no matching NAD"
+  vars:
+    _ref: "{{ item.1.multus.networkName }}"
+    _resolved: "{{ _ref if ('/' in _ref) else (item.0.metadata.namespace ~ '/' ~ _ref) }}"
+  ansible.builtin.set_fact:
+    _vmi_missing_nad_refs: "{{ _vmi_missing_nad_refs + [item.0.metadata.namespace ~ '/' ~ item.0.metadata.name ~ ' references missing NAD ' ~ _ref] }}"
+  loop: "{{ _vmis_annotated | subelements('_multus_networks', skip_missing=True) }}"
+  loop_control:
+    label: "{{ item.0.metadata.name }}"
+  when: _resolved not in _nad_existing_refs
+
+# --- 6. VLAN cross-check: NNCP-configured vs NAD-referenced ------------
+
+- name: "check_vm_networking | Collect NNCP-configured VLAN IDs"
+  ansible.builtin.set_fact:
+    _nncp_vlans: >-
+      {{
+        (_nncp.resources | default([]))
+        | subelements('spec.desiredState.interfaces', skip_missing=True)
+        | selectattr('1.vlan.id', 'defined')
+        | map(attribute='1.vlan.id')
+        | unique | list
+      }}
+
+- name: "check_vm_networking | Collect NAD-referenced VLAN IDs"
+  vars:
+    _nad_configs: "{{ _nads.resources | default([]) | map(attribute='spec.config') | map('from_json') | list }}"
+  ansible.builtin.set_fact:
+    _nad_vlans: "{{ _nad_configs | selectattr('vlan', 'defined') | map(attribute='vlan') | unique | list }}"
+  ignore_errors: true
+
+- name: "check_vm_networking | Determine VLAN mismatches (configured but unreferenced, or referenced but unconfigured)"
+  ansible.builtin.set_fact:
+    _vlans_configured_not_referenced: "{{ (_nncp_vlans | default([])) | difference(_nad_vlans | default([])) }}"
+    _vlans_referenced_not_configured: "{{ (_nad_vlans | default([])) | difference(_nncp_vlans | default([])) }}"
+
+# --- Finalize ------------------------------------------------------------
+
+- name: "check_vm_networking | Finalize result"
+  vars:
+    _nmstate_present: "{{ (_nmstate_csv | default({}) | length) > 0 }}"
+    _nmstate_phase: "{{ _nmstate_csv.status.phase | default('NotFound') }}"
+    _total_problems: >-
+      {{
+        (_nncp_problems | length | int) + (_nic_mismatch_nodes | length | int)
+        + (_vmi_missing_nad_refs | length | int)
+      }}
+  ansible.builtin.set_fact:
+    _vm_networking_result:
+      check: check_vm_networking
+      status: >-
+        {{
+          'FAIL' if (_total_problems | int > 0) else
+          'PASS'
+        }}
+      message: >-
+        {%- if _total_problems | int > 0 -%}
+        {{ _total_problems }} problem(s) found
+        {%- if _nncp_problems | length > 0 %}; NNCPs not healthy: {{ _nncp_problems | join(', ') }}{% endif %}
+        {%- if _nic_mismatch_nodes | length > 0 %}; NIC mismatches: {{ _nic_mismatch_nodes | join('; ') }}{% endif %}
+        {%- if _vmi_missing_nad_refs | length > 0 %}; VMIs referencing missing NADs: {{ _vmi_missing_nad_refs | join('; ') }}{% endif %}
+        {%- else -%}
+        networking healthy: NMState {{ 'installed (' ~ _nmstate_phase ~ ')' if _nmstate_present else 'not installed (optional)' }}, {{ _nncp.resources | default([]) | length }} NNCP(s) healthy, NICs consistent per role, {{ _nad_existing_refs | length }} NAD(s) all VMI references resolve
+        {%- endif -%}
+      data:
+        nmstate_present: "{{ _nmstate_present }}"
+        nmstate_phase: "{{ _nmstate_phase }}"
+        nncp_problems: "{{ _nncp_problems }}"
+        node_nics: "{{ _node_nics }}"
+        nic_mismatch_nodes: "{{ _nic_mismatch_nodes }}"
+        dedicated_networks: "{{ _dedicated_networks }}"
+        nad_count: "{{ _nad_existing_refs | length }}"
+        vmi_missing_nad_refs: "{{ _vmi_missing_nad_refs }}"
+        nncp_vlans: "{{ _nncp_vlans | default([]) }}"
+        nad_vlans: "{{ _nad_vlans | default([]) }}"
+        vlans_configured_not_referenced: "{{ _vlans_configured_not_referenced | default([]) }}"
+        vlans_referenced_not_configured: "{{ _vlans_referenced_not_configured | default([]) }}"
+
+- name: "check_vm_networking | Record result"
+  ansible.builtin.set_fact:
+    healthcheck_results: "{{ healthcheck_results + [_vm_networking_result] }}"
+
+- name: "check_vm_networking | Show result"
+  ansible.builtin.debug:
+    var: _vm_networking_result

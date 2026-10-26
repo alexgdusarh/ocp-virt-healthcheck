@@ -25,6 +25,13 @@ pip install -r requirements.txt
 ansible-galaxy collection install -r requirements.yaml
 ```
 
+Check 11 (`check_vm_networking`) additionally requires the `oc` CLI itself
+to be installed and on `PATH` wherever the Ansible role runs (it shells
+out to `oc debug node/<node>` to read each node's physical NICs via
+`nmcli` — there is no `kubernetes.core` equivalent for a node-level debug
+exec, and reimplementing `oc debug`'s privileged-pod lifecycle would be
+more invasive than using the tool built for it).
+
 ## Usage
 
 Assumes you're already logged in (`oc login`) or have a valid `KUBECONFIG`
@@ -66,6 +73,9 @@ different `KUBECONFIG` — each run produces its own report under `reports/`.
 | 7 | CNV operator (CSV Succeeded) + HyperConverged CR health | `oc-commands/07_check_hco_status.sh` | `roles/check_hco_status` |
 | 8 | KubeVirt CR + virt-api/virt-controller/virt-handler readiness | `oc-commands/08_check_kubevirt_components.sh` | `roles/check_kubevirt_components` |
 | 9 | StorageClass + CDI (DataVolume import) readiness | `oc-commands/09_check_cdi_storage.sh` | `roles/check_cdi_storage` |
+| 10 | VirtualMachine/VirtualMachineInstance health (printableStatus, phase, Ready) | `oc-commands/10_check_vm_health.sh` | `roles/check_vm_health` |
+| 11 | VM networking: NMState/NNCP, physical NIC consistency per node role, dedicated networks, NAD + VLAN cross-check | `oc-commands/11_check_vm_networking.sh` | `roles/check_vm_networking` |
+| 12 | Live migration readiness (failed/in-flight VMIMs, non-migratable volumes needing LiveMigrate) | `oc-commands/12_check_live_migration.sh` | `roles/check_live_migration` |
 
 ## License
 

@@ -60,6 +60,12 @@
       tags: [check_kubevirt_components]
     - role: check_cdi_storage
       tags: [check_cdi_storage]
+    - role: check_vm_health
+      tags: [check_vm_health]
+    - role: check_vm_networking
+      tags: [check_vm_networking]
+    - role: check_live_migration
+      tags: [check_live_migration]
 
   post_tasks:
     - name: Ensure report directory exists
