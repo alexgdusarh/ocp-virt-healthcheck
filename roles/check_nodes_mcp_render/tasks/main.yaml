@@ -1,0 +1,107 @@
+---
+# Check: Nodes match their MachineConfigPool's rendered config
+#
+# Pool membership is derived generically from each MCP's own
+# spec.nodeSelector.matchLabels against each node's labels (a node
+# belongs to a pool if the pool's matchLabels is a subset of the
+# node's labels) - not a hard-coded worker/master assumption, so a
+# custom pool (e.g. infra, or a virt-dedicated pool) is covered too.
+#
+# PASS only if every node belongs to at least one pool, and its
+# current == desired == that pool's rendered config.
+
+- name: "check_nodes_mcp_render | Get MachineConfigPools"
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ k8s_auth_kubeconfig | default(omit) }}"
+    api_token: "{{ k8s_auth_api_token | default(omit) }}"
+    api_version: machineconfiguration.openshift.io/v1
+    kind: MachineConfigPool
+  register: _mcp
+
+- name: "check_nodes_mcp_render | Get Nodes"
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ k8s_auth_kubeconfig | default(omit) }}"
+    api_token: "{{ k8s_auth_api_token | default(omit) }}"
+    kind: Node
+  register: _nodes
+
+- name: "check_nodes_mcp_render | Reset accumulators"
+  ansible.builtin.set_fact:
+    _node_pool_pairs: []
+    _node_render_summary: []
+    _node_render_problems: []
+
+- name: "check_nodes_mcp_render | Build node x pool membership pairs"
+  vars:
+    _pairs: "{{ (_nodes.resources | default([])) | product(_mcp.resources | default([])) | list }}"
+  ansible.builtin.set_fact:
+    _node_pool_pairs: "{{ _node_pool_pairs + [{'node': item.0.metadata.name, 'pool': item.1.metadata.name, 'rendered_config': (item.1.status.configuration.name | default('unknown'))}] }}"
+  loop: "{{ _pairs }}"
+  loop_control:
+    label: "{{ item.0.metadata.name }}/{{ item.1.metadata.name }}"
+  when: >-
+    (item.1.spec.nodeSelector.matchLabels | default({})) | length > 0
+    and ((item.0.metadata.labels | default({})) | combine(item.1.spec.nodeSelector.matchLabels)) == (item.0.metadata.labels | default({}))
+
+- name: "check_nodes_mcp_render | Build per-node summary"
+  vars:
+    _current: "{{ item.metadata.annotations['machineconfiguration.openshift.io/currentConfig'] | default('none') }}"
+    _desired: "{{ item.metadata.annotations['machineconfiguration.openshift.io/desiredConfig'] | default('none') }}"
+    _state: "{{ item.metadata.annotations['machineconfiguration.openshift.io/state'] | default('none') }}"
+    _node_pools: "{{ _node_pool_pairs | selectattr('node', 'equalto', item.metadata.name) | list }}"
+  ansible.builtin.set_fact:
+    _node_render_summary: >-
+      {{
+        _node_render_summary + [{
+          'node': item.metadata.name,
+          'current_config': _current,
+          'desired_config': _desired,
+          'state': _state,
+          'pools': (_node_pools | map(attribute='pool') | list),
+          'pool_rendered_configs': (_node_pools | map(attribute='rendered_config') | unique | list)
+        }]
+      }}
+  loop: "{{ _nodes.resources | default([]) }}"
+  loop_control:
+    label: "{{ item.metadata.name }}"
+
+- name: "check_nodes_mcp_render | Flag nodes not matching their pool's rendered config"
+  ansible.builtin.set_fact:
+    _node_render_problems: "{{ _node_render_problems + [item.node ~ ' (pools: ' ~ (item.pools | join(',') if item.pools | length > 0 else 'NONE') ~ ')'] }}"
+  loop: "{{ _node_render_summary }}"
+  loop_control:
+    label: "{{ item.node }}"
+  when: >-
+    item.current_config != item.desired_config
+    or item.pools | length == 0
+    or item.pool_rendered_configs | reject('equalto', item.current_config) | list | length > 0
+
+- name: "check_nodes_mcp_render | Finalize result"
+  ansible.builtin.set_fact:
+    _nodes_mcp_render_result:
+      check: check_nodes_mcp_render
+      status: >-
+        {{
+          'FAIL' if (_nodes.resources | default([]) | length == 0 or _mcp.resources | default([]) | length == 0) else
+          'FAIL' if (_node_render_problems | length > 0) else
+          'PASS'
+        }}
+      message: >-
+        {%- if _nodes.resources | default([]) | length == 0 or _mcp.resources | default([]) | length == 0 -%}
+        Unable to read Nodes or MachineConfigPools (insufficient permissions or API unreachable)
+        {%- elif _node_render_problems | length > 0 -%}
+        {{ _node_render_problems | length }} node(s) not matching their pool's rendered config: {{ _node_render_problems | join('; ') }}
+        {%- else -%}
+        all {{ _node_render_summary | length }} nodes match their MachineConfigPool's rendered config
+        {%- endif -%}
+      data:
+        nodes: "{{ _node_render_summary }}"
+        problem_nodes: "{{ _node_render_problems }}"
+
+- name: "check_nodes_mcp_render | Record result"
+  ansible.builtin.set_fact:
+    healthcheck_results: "{{ healthcheck_results + [_nodes_mcp_render_result] }}"
+
+- name: "check_nodes_mcp_render | Show result"
+  ansible.builtin.debug:
+    var: _nodes_mcp_render_result

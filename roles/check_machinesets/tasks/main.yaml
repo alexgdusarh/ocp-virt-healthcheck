@@ -1,0 +1,106 @@
+---
+# Check: MachineSets (and backing Machines) status
+#
+# MachineSets are not always present - many bare-metal/UPI installs have
+# no machine-api MachineSets at all, and that's normal, not a failure.
+# This check PASSes with an informational message when none exist, and
+# only evaluates replica health when MachineSets are actually found.
+
+- name: "check_machinesets | Get MachineSets"
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ k8s_auth_kubeconfig | default(omit) }}"
+    api_token: "{{ k8s_auth_api_token | default(omit) }}"
+    api_version: machine.openshift.io/v1beta1
+    kind: MachineSet
+    namespace: openshift-machine-api
+  register: _machinesets
+  ignore_errors: true
+
+- name: "check_machinesets | Get Machines"
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ k8s_auth_kubeconfig | default(omit) }}"
+    api_token: "{{ k8s_auth_api_token | default(omit) }}"
+    api_version: machine.openshift.io/v1beta1
+    kind: Machine
+    namespace: openshift-machine-api
+  register: _machines
+  ignore_errors: true
+  when: not _machinesets.failed and (_machinesets.resources | default([]) | length > 0)
+
+- name: "check_machinesets | Reset accumulators"
+  ansible.builtin.set_fact:
+    _machineset_summary: []
+    _machineset_problems: []
+    _machine_problems: []
+
+- name: "check_machinesets | Build per-machineset summary"
+  ansible.builtin.set_fact:
+    _machineset_summary: >-
+      {{
+        _machineset_summary + [{
+          'name': item.metadata.name,
+          'desired': (item.spec.replicas | default(0)),
+          'current': (item.status.replicas | default(0)),
+          'ready': (item.status.readyReplicas | default(0)),
+          'available': (item.status.availableReplicas | default(0))
+        }]
+      }}
+  loop: "{{ _machinesets.resources | default([]) }}"
+  loop_control:
+    label: "{{ item.metadata.name }}"
+  when: not _machinesets.failed | default(false)
+
+- name: "check_machinesets | Flag machinesets not fully ready/available"
+  ansible.builtin.set_fact:
+    _machineset_problems: "{{ _machineset_problems + [item.name] }}"
+  loop: "{{ _machineset_summary }}"
+  loop_control:
+    label: "{{ item.name }}"
+  when: item.desired != item.ready or item.desired != item.available
+
+- name: "check_machinesets | Flag machines not in Running phase"
+  ansible.builtin.set_fact:
+    _machine_problems: "{{ _machine_problems + [item.metadata.name ~ ' (phase: ' ~ (item.status.phase | default('Unknown')) ~ ')'] }}"
+  loop: "{{ _machines.resources | default([]) }}"
+  loop_control:
+    label: "{{ item.metadata.name }}"
+  when: >-
+    not (_machinesets.failed | default(false))
+    and (_machinesets.resources | default([]) | length > 0)
+    and (item.status.phase | default('Unknown')) != 'Running'
+
+- name: "check_machinesets | Finalize result"
+  vars:
+    _api_unavailable: "{{ _machinesets.failed | default(false) }}"
+    _none_present: "{{ not _api_unavailable and (_machinesets.resources | default([]) | length == 0) }}"
+  ansible.builtin.set_fact:
+    _machinesets_result:
+      check: check_machinesets
+      status: >-
+        {{
+          'FAIL' if (_machineset_problems | length > 0 or _machine_problems | length > 0) else
+          'PASS'
+        }}
+      message: >-
+        {%- if _api_unavailable -%}
+        MachineSet API not present or inaccessible (expected on many bare-metal installs)
+        {%- elif _none_present -%}
+        MachineSet API present, 0 MachineSets found (expected on many bare-metal installs)
+        {%- elif _machineset_problems | length > 0 or _machine_problems | length > 0 -%}
+        {{ _machineset_problems | length }} MachineSet(s) not fully ready/available{{ ': ' ~ (_machineset_problems | join(', ')) if _machineset_problems | length > 0 else '' }}{{ '; ' ~ (_machine_problems | length) ~ ' Machine(s) not Running: ' ~ (_machine_problems | join(', ')) if _machine_problems | length > 0 else '' }}
+        {%- else -%}
+        all {{ _machineset_summary | length }} MachineSets ready/available, all Machines Running
+        {%- endif -%}
+      data:
+        machinesets: "{{ _machineset_summary }}"
+        machineset_problems: "{{ _machineset_problems }}"
+        machine_problems: "{{ _machine_problems }}"
+        api_present: "{{ not _api_unavailable }}"
+
+- name: "check_machinesets | Record result"
+  ansible.builtin.set_fact:
+    healthcheck_results: "{{ healthcheck_results + [_machinesets_result] }}"
+
+- name: "check_machinesets | Show result"
+  ansible.builtin.debug:
+    var: _machinesets_result

@@ -1,0 +1,116 @@
+---
+# Check: BareMetalHost presence and linkage to Machine/MachineSet/Node
+#
+# BareMetalHosts (metal3) only exist on installer-provisioned
+# bare-metal (IPI) clusters - absence is normal elsewhere, not a
+# failure. When BMHs exist, this cross-references:
+#   BareMetalHost.spec.consumerRef.name  -> Machine
+#   Machine.metadata.ownerReferences     -> MachineSet (if any)
+#   Machine.status.nodeRef.name          -> Node
+# and flags any BMH left unconsumed, or any Machine/BMH pairing that
+# doesn't resolve all the way through to a Node.
+
+- name: "check_baremetalhosts | Get BareMetalHosts"
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ k8s_auth_kubeconfig | default(omit) }}"
+    api_token: "{{ k8s_auth_api_token | default(omit) }}"
+    api_version: metal3.io/v1alpha1
+    kind: BareMetalHost
+  register: _bmh
+  ignore_errors: true
+
+- name: "check_baremetalhosts | Get Machines"
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ k8s_auth_kubeconfig | default(omit) }}"
+    api_token: "{{ k8s_auth_api_token | default(omit) }}"
+    api_version: machine.openshift.io/v1beta1
+    kind: Machine
+    namespace: openshift-machine-api
+  register: _machines_for_bmh
+  ignore_errors: true
+  when: not (_bmh.failed | default(false)) and (_bmh.resources | default([]) | length > 0)
+
+- name: "check_baremetalhosts | Reset accumulators"
+  ansible.builtin.set_fact:
+    _bmh_summary: []
+    _bmh_problems: []
+
+- name: "check_baremetalhosts | Build per-BMH linkage summary"
+  vars:
+    _consumer_name: "{{ item.spec.consumerRef.name | default('') }}"
+    _matched_machines: "{{ (_machines_for_bmh.resources | default([])) | selectattr('metadata.name', 'equalto', _consumer_name) | list }}"
+    _machine: "{{ _matched_machines[0] | default({}) }}"
+    _machine_owner_refs: "{{ _machine.metadata.ownerReferences | default([]) }}"
+    _owning_machineset: "{{ (_machine_owner_refs | selectattr('kind', 'equalto', 'MachineSet') | map(attribute='name') | list | first) | default('') }}"
+    _node_ref: "{{ _machine.status.nodeRef.name | default('') }}"
+  ansible.builtin.set_fact:
+    _bmh_summary: >-
+      {{
+        _bmh_summary + [{
+          'bmh': item.metadata.namespace ~ '/' ~ item.metadata.name,
+          'provisioning_state': (item.status.provisioning.state | default('unknown')),
+          'consumer_machine': (_consumer_name if _consumer_name != '' else none),
+          'machine_found': (_matched_machines | length > 0),
+          'owning_machineset': (_owning_machineset if _owning_machineset != '' else none),
+          'node_ref': (_node_ref if _node_ref != '' else none)
+        }]
+      }}
+  loop: "{{ _bmh.resources | default([]) }}"
+  loop_control:
+    label: "{{ item.metadata.name }}"
+  when: not (_bmh.failed | default(false))
+
+- name: "check_baremetalhosts | Flag unconsumed or incompletely-linked BMHs"
+  ansible.builtin.set_fact:
+    _bmh_problems: >-
+      {{
+        _bmh_problems + [
+          item.bmh ~ ' (' ~ (
+            'no consumerRef' if item.consumer_machine is none else
+            'consumerRef points to missing Machine ' ~ item.consumer_machine if not item.machine_found else
+            'Machine has no nodeRef (not yet a Node)'
+          ) ~ ')'
+        ]
+      }}
+  loop: "{{ _bmh_summary }}"
+  loop_control:
+    label: "{{ item.bmh }}"
+  when: >-
+    item.consumer_machine is none
+    or not item.machine_found
+    or item.node_ref is none
+
+- name: "check_baremetalhosts | Finalize result"
+  vars:
+    _api_unavailable: "{{ _bmh.failed | default(false) }}"
+    _none_present: "{{ not _api_unavailable and (_bmh.resources | default([]) | length == 0) }}"
+  ansible.builtin.set_fact:
+    _baremetalhosts_result:
+      check: check_baremetalhosts
+      status: >-
+        {{
+          'FAIL' if (_bmh_problems | length > 0) else
+          'PASS'
+        }}
+      message: >-
+        {%- if _api_unavailable -%}
+        BareMetalHost CRD not present or inaccessible (expected on non-metal3 installs)
+        {%- elif _none_present -%}
+        BareMetalHost CRD present, 0 BareMetalHosts found
+        {%- elif _bmh_problems | length > 0 -%}
+        {{ _bmh_problems | length }} BareMetalHost(s) not fully linked to a Machine/Node: {{ _bmh_problems | join('; ') }}
+        {%- else -%}
+        all {{ _bmh_summary | length }} BareMetalHosts linked through to a Machine and Node
+        {%- endif -%}
+      data:
+        baremetalhosts: "{{ _bmh_summary }}"
+        problem_hosts: "{{ _bmh_problems }}"
+        api_present: "{{ not _api_unavailable }}"
+
+- name: "check_baremetalhosts | Record result"
+  ansible.builtin.set_fact:
+    healthcheck_results: "{{ healthcheck_results + [_baremetalhosts_result] }}"
+
+- name: "check_baremetalhosts | Show result"
+  ansible.builtin.debug:
+    var: _baremetalhosts_result

@@ -1,0 +1,76 @@
+---
+# Check: ClusterOperators status
+#
+# PASS only if every ClusterOperator reports Available=True,
+# Progressing=False, Degraded=False.
+
+- name: "check_clusteroperators | Get ClusterOperators"
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ k8s_auth_kubeconfig | default(omit) }}"
+    api_token: "{{ k8s_auth_api_token | default(omit) }}"
+    api_version: config.openshift.io/v1
+    kind: ClusterOperator
+  register: _co
+
+- name: "check_clusteroperators | Reset per-operator summary"
+  ansible.builtin.set_fact:
+    _co_summary: []
+    _unhealthy: []
+
+- name: "check_clusteroperators | Build per-operator condition summary"
+  ansible.builtin.set_fact:
+    _co_summary: >-
+      {{
+        _co_summary + [{
+          'name': item.metadata.name,
+          'available': (item.status.conditions | default([]) | selectattr('type', 'equalto', 'Available') | map(attribute='status') | list | first | default('Unknown')),
+          'progressing': (item.status.conditions | default([]) | selectattr('type', 'equalto', 'Progressing') | map(attribute='status') | list | first | default('Unknown')),
+          'degraded': (item.status.conditions | default([]) | selectattr('type', 'equalto', 'Degraded') | map(attribute='status') | list | first | default('Unknown'))
+        }]
+      }}
+  loop: "{{ _co.resources | default([]) }}"
+  loop_control:
+    label: "{{ item.metadata.name }}"
+
+- name: "check_clusteroperators | Flag operators not in healthy steady state"
+  ansible.builtin.set_fact:
+    _unhealthy: "{{ _unhealthy + [item] }}"
+  loop: "{{ _co_summary }}"
+  loop_control:
+    label: "{{ item.name }}"
+  when: >-
+    item.available != 'True'
+    or item.degraded != 'False'
+    or item.progressing != 'False'
+
+- name: "check_clusteroperators | Finalize result"
+  vars:
+    _unhealthy_names: "{{ _unhealthy | map(attribute='name') | unique | list }}"
+  ansible.builtin.set_fact:
+    _clusteroperators_result:
+      check: check_clusteroperators
+      status: >-
+        {{
+          'FAIL' if (_co.resources | default([]) | length == 0) else
+          'FAIL' if (_unhealthy_names | length > 0) else
+          'PASS'
+        }}
+      message: >-
+        {%- if _co.resources | default([]) | length == 0 -%}
+        Unable to read ClusterOperators (insufficient permissions or API unreachable)
+        {%- elif _unhealthy_names | length > 0 -%}
+        {{ _unhealthy_names | length }} operator(s) not Available/steady: {{ _unhealthy_names | join(', ') }}
+        {%- else -%}
+        all {{ _co_summary | length }} ClusterOperators Available=True, Progressing=False, Degraded=False
+        {%- endif -%}
+      data:
+        total: "{{ _co_summary | length }}"
+        unhealthy: "{{ _unhealthy }}"
+
+- name: "check_clusteroperators | Record result"
+  ansible.builtin.set_fact:
+    healthcheck_results: "{{ healthcheck_results + [_clusteroperators_result] }}"
+
+- name: "check_clusteroperators | Show result"
+  ansible.builtin.debug:
+    var: _clusteroperators_result

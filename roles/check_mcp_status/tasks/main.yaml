@@ -1,0 +1,76 @@
+---
+# Check: MachineConfigPool status
+#
+# PASS only if every MCP has machineCount == readyMachineCount ==
+# updatedMachineCount and is not reporting Degraded=True.
+
+- name: "check_mcp_status | Get MachineConfigPools"
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ k8s_auth_kubeconfig | default(omit) }}"
+    api_token: "{{ k8s_auth_api_token | default(omit) }}"
+    api_version: machineconfiguration.openshift.io/v1
+    kind: MachineConfigPool
+  register: _mcp
+
+- name: "check_mcp_status | Reset per-pool summary"
+  ansible.builtin.set_fact:
+    _mcp_summary: []
+    _mcp_problem_pools: []
+
+- name: "check_mcp_status | Build per-pool summary"
+  ansible.builtin.set_fact:
+    _mcp_summary: >-
+      {{
+        _mcp_summary + [{
+          'name': item.metadata.name,
+          'machine_count': (item.status.machineCount | default(0)),
+          'ready_count': (item.status.readyMachineCount | default(0)),
+          'updated_count': (item.status.updatedMachineCount | default(0)),
+          'degraded': ((item.status.conditions | default([]) | selectattr('type', 'equalto', 'Degraded') | map(attribute='status') | list | first | default('False')) == 'True'),
+          'rendered_config': (item.status.configuration.name | default('unknown'))
+        }]
+      }}
+  loop: "{{ _mcp.resources | default([]) }}"
+  loop_control:
+    label: "{{ item.metadata.name }}"
+
+- name: "check_mcp_status | Flag pools that are degraded or not fully ready/updated"
+  ansible.builtin.set_fact:
+    _mcp_problem_pools: "{{ _mcp_problem_pools + [item.name] }}"
+  loop: "{{ _mcp_summary }}"
+  loop_control:
+    label: "{{ item.name }}"
+  when: >-
+    item.degraded
+    or item.machine_count != item.ready_count
+    or item.machine_count != item.updated_count
+
+- name: "check_mcp_status | Finalize result"
+  ansible.builtin.set_fact:
+    _mcp_status_result:
+      check: check_mcp_status
+      status: >-
+        {{
+          'FAIL' if (_mcp.resources | default([]) | length == 0) else
+          'FAIL' if (_mcp_problem_pools | length > 0) else
+          'PASS'
+        }}
+      message: >-
+        {%- if _mcp.resources | default([]) | length == 0 -%}
+        Unable to read MachineConfigPools (insufficient permissions or API unreachable)
+        {%- elif _mcp_problem_pools | length > 0 -%}
+        {{ _mcp_problem_pools | length }} pool(s) degraded or not fully updated: {{ _mcp_problem_pools | join(', ') }}
+        {%- else -%}
+        all {{ _mcp_summary | length }} MachineConfigPools ready and updated ({{ _mcp_summary | map(attribute='name') | join(', ') }})
+        {%- endif -%}
+      data:
+        pools: "{{ _mcp_summary }}"
+        problem_pools: "{{ _mcp_problem_pools }}"
+
+- name: "check_mcp_status | Record result"
+  ansible.builtin.set_fact:
+    healthcheck_results: "{{ healthcheck_results + [_mcp_status_result] }}"
+
+- name: "check_mcp_status | Show result"
+  ansible.builtin.debug:
+    var: _mcp_status_result

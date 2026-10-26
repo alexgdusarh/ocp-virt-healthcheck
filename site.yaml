@@ -44,6 +44,16 @@
   roles:
     - role: check_clusterversion
       tags: [check_clusterversion]
+    - role: check_clusteroperators
+      tags: [check_clusteroperators]
+    - role: check_mcp_status
+      tags: [check_mcp_status]
+    - role: check_nodes_mcp_render
+      tags: [check_nodes_mcp_render]
+    - role: check_machinesets
+      tags: [check_machinesets]
+    - role: check_baremetalhosts
+      tags: [check_baremetalhosts]
 
   post_tasks:
     - name: Ensure report directory exists

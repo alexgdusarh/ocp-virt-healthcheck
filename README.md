@@ -56,6 +56,11 @@ different `KUBECONFIG` — each run produces its own report under `reports/`.
 | Check | oc script | Role |
 |---|---|---|
 | ClusterVersion status (version, conditions, TechPreview/FeatureGate) | `oc-commands/check_clusterversion.sh` | `roles/check_clusterversion` |
+| ClusterOperators all Available/steady | `oc-commands/check_clusteroperators.sh` | `roles/check_clusteroperators` |
+| MachineConfigPool members ready/updated | `oc-commands/check_mcp_status.sh` | `roles/check_mcp_status` |
+| Nodes match their pool's rendered MachineConfig | `oc-commands/check_nodes_mcp_render.sh` | `roles/check_nodes_mcp_render` |
+| MachineSets/Machines ready (optional - not present on all bare-metal) | `oc-commands/check_machinesets.sh` | `roles/check_machinesets` |
+| BareMetalHost linkage to Machine/MachineSet/Node (optional - IPI metal3 only) | `oc-commands/check_baremetalhosts.sh` | `roles/check_baremetalhosts` |
 
 ## License
 
