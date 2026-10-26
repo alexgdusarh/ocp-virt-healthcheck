@@ -1,0 +1,138 @@
+---
+# Check: SDN - OVN-Kubernetes
+#
+# Only meaningful when the cluster's detected CNI is OVN-Kubernetes
+# (set as `detected_sdn` by site.yaml's pre_tasks). PASS only if the
+# "network" ClusterOperator is Available/not Degraded, ovnkube-node
+# DaemonSet is fully ready, ovnkube-control-plane Deployment is fully
+# ready, and every ovnkube pod is Running with all containers ready.
+
+- name: "check_sdn_ovnk | Get network ClusterOperator"
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ k8s_auth_kubeconfig | default(omit) }}"
+    api_token: "{{ k8s_auth_api_token | default(omit) }}"
+    api_version: config.openshift.io/v1
+    kind: ClusterOperator
+    name: network
+  register: _network_co
+  ignore_errors: true
+
+- name: "check_sdn_ovnk | Get ovnkube-node DaemonSet"
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ k8s_auth_kubeconfig | default(omit) }}"
+    api_token: "{{ k8s_auth_api_token | default(omit) }}"
+    api_version: apps/v1
+    kind: DaemonSet
+    name: ovnkube-node
+    namespace: "{{ ovnk_namespace | default('openshift-ovn-kubernetes') }}"
+  register: _ovnkube_node_ds
+  ignore_errors: true
+
+- name: "check_sdn_ovnk | Get ovnkube-control-plane Deployment"
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ k8s_auth_kubeconfig | default(omit) }}"
+    api_token: "{{ k8s_auth_api_token | default(omit) }}"
+    api_version: apps/v1
+    kind: Deployment
+    name: ovnkube-control-plane
+    namespace: "{{ ovnk_namespace | default('openshift-ovn-kubernetes') }}"
+  register: _ovnkube_cp_deploy
+  ignore_errors: true
+
+- name: "check_sdn_ovnk | Get ovnkube Pods"
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ k8s_auth_kubeconfig | default(omit) }}"
+    api_token: "{{ k8s_auth_api_token | default(omit) }}"
+    kind: Pod
+    namespace: "{{ ovnk_namespace | default('openshift-ovn-kubernetes') }}"
+  register: _ovnkube_pods
+  ignore_errors: true
+
+- name: "check_sdn_ovnk | Reset accumulators"
+  ansible.builtin.set_fact:
+    _ovnk_co_problems: []
+    _ovnk_pod_problems: []
+
+- name: "check_sdn_ovnk | Flag unhealthy network ClusterOperator conditions"
+  vars:
+    _co: "{{ (_network_co.resources | default([])) | first | default({}) }}"
+    _conditions: "{{ (_co.status | default({})).conditions | default([]) }}"
+  ansible.builtin.set_fact:
+    _ovnk_co_conditions: "{{ _conditions }}"
+
+- name: "check_sdn_ovnk | Flag network ClusterOperator not healthy"
+  ansible.builtin.set_fact:
+    _ovnk_co_problems: "{{ _ovnk_co_problems + [item.type ~ '=' ~ item.status ~ ' (' ~ (item.reason | default('')) ~ ')'] }}"
+  loop: "{{ _ovnk_co_conditions }}"
+  loop_control:
+    label: "{{ item.type }}"
+  when: >-
+    (item.type == 'Available' and item.status != 'True')
+    or (item.type == 'Degraded' and item.status != 'False')
+
+- name: "check_sdn_ovnk | Evaluate ovnkube-node DaemonSet readiness"
+  vars:
+    _ds: "{{ (_ovnkube_node_ds.resources | default([])) | first | default({}) }}"
+  ansible.builtin.set_fact:
+    _ovnk_ds_desired: "{{ (_ds.status | default({})).desiredNumberScheduled | default(0) }}"
+    _ovnk_ds_ready: "{{ (_ds.status | default({})).numberReady | default(0) }}"
+
+- name: "check_sdn_ovnk | Evaluate ovnkube-control-plane Deployment readiness"
+  vars:
+    _dep: "{{ (_ovnkube_cp_deploy.resources | default([])) | first | default({}) }}"
+  ansible.builtin.set_fact:
+    _ovnk_cp_desired: "{{ (_dep.spec | default({})).replicas | default(0) }}"
+    _ovnk_cp_ready: "{{ (_dep.status | default({})).readyReplicas | default(0) }}"
+
+- name: "check_sdn_ovnk | Flag ovnkube Pods not Running/Ready"
+  vars:
+    _container_statuses: "{{ item.status.containerStatuses | default([]) }}"
+    _all_ready: "{{ (_container_statuses | map(attribute='ready') | list | unique) == [true] if _container_statuses | length > 0 else false }}"
+  ansible.builtin.set_fact:
+    _ovnk_pod_problems: "{{ _ovnk_pod_problems + [item.metadata.name ~ ' (phase=' ~ (item.status.phase | default('Unknown')) ~ ')'] }}"
+  loop: "{{ _ovnkube_pods.resources | default([]) }}"
+  loop_control:
+    label: "{{ item.metadata.name }}"
+  when: (item.status.phase | default('Unknown')) != 'Running' or not _all_ready
+
+- name: "check_sdn_ovnk | Finalize result"
+  vars:
+    _total_problems: >-
+      {{
+        (_ovnk_co_problems | length | int) + (_ovnk_pod_problems | length | int)
+        + (0 if (_ovnk_ds_desired | int) == (_ovnk_ds_ready | int) else 1)
+        + (0 if (_ovnk_cp_desired | int) == (_ovnk_cp_ready | int) else 1)
+      }}
+  ansible.builtin.set_fact:
+    _sdn_ovnk_result:
+      check: check_sdn_ovnk
+      status: >-
+        {{
+          'FAIL' if (_total_problems | int > 0) else
+          'PASS'
+        }}
+      message: >-
+        {%- if _total_problems | int > 0 -%}
+        {{ _total_problems }} problem(s) found
+        {%- if _ovnk_co_problems | length > 0 %}; network ClusterOperator: {{ _ovnk_co_problems | join('; ') }}{% endif %}
+        {%- if (_ovnk_ds_desired | int) != (_ovnk_ds_ready | int) %}; ovnkube-node DaemonSet {{ _ovnk_ds_ready }}/{{ _ovnk_ds_desired }} ready{% endif %}
+        {%- if (_ovnk_cp_desired | int) != (_ovnk_cp_ready | int) %}; ovnkube-control-plane {{ _ovnk_cp_ready }}/{{ _ovnk_cp_desired }} ready{% endif %}
+        {%- if _ovnk_pod_problems | length > 0 %}; Pods not Running/Ready: {{ _ovnk_pod_problems | join('; ') }}{% endif %}
+        {%- else -%}
+        OVN-Kubernetes healthy: network ClusterOperator OK, ovnkube-node {{ _ovnk_ds_ready }}/{{ _ovnk_ds_desired }}, ovnkube-control-plane {{ _ovnk_cp_ready }}/{{ _ovnk_cp_desired }}, all pods Running/Ready
+        {%- endif -%}
+      data:
+        co_conditions: "{{ _ovnk_co_conditions }}"
+        ovnkube_node_ready: "{{ _ovnk_ds_ready }}"
+        ovnkube_node_desired: "{{ _ovnk_ds_desired }}"
+        ovnkube_control_plane_ready: "{{ _ovnk_cp_ready }}"
+        ovnkube_control_plane_desired: "{{ _ovnk_cp_desired }}"
+        pod_problems: "{{ _ovnk_pod_problems }}"
+
+- name: "check_sdn_ovnk | Record result"
+  ansible.builtin.set_fact:
+    healthcheck_results: "{{ healthcheck_results + [_sdn_ovnk_result] }}"
+
+- name: "check_sdn_ovnk | Show result"
+  ansible.builtin.debug:
+    var: _sdn_ovnk_result

@@ -41,6 +41,39 @@
              | regex_replace('[^A-Za-z0-9_.-]', '_') }}
         healthcheck_timestamp: "{{ '%Y%m%dT%H%M%SZ' | strftime }}"
 
+    - name: Detect the cluster's configured CNI - networkType (corroborating signal)
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ k8s_auth_kubeconfig | default(omit) }}"
+        api_token: "{{ k8s_auth_api_token | default(omit) }}"
+        api_version: config.openshift.io/v1
+        kind: Network
+        name: cluster
+      register: _network_config
+      ignore_errors: true
+
+    - name: Detect the cluster's configured CNI - CiliumNode CRD (primary signal)
+      # networkType is a free-form string, not an enforced enum - Cilium's
+      # own OLM install tooling conventionally sets it to "Cilium", but
+      # that spelling is a convention, not a guaranteed cross-vendor
+      # contract. CRD existence is the robust signal: it only exists once
+      # the Cilium operator has actually run.
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ k8s_auth_kubeconfig | default(omit) }}"
+        api_token: "{{ k8s_auth_api_token | default(omit) }}"
+        api_version: apiextensions.k8s.io/v1
+        kind: CustomResourceDefinition
+        name: ciliumnodes.cilium.io
+      register: _cilium_crd
+      ignore_errors: true
+
+    - name: Set detected_sdn fact
+      ansible.builtin.set_fact:
+        detected_sdn: >-
+          {{
+            'Cilium' if (not (_cilium_crd.failed | default(false)) and (_cilium_crd.resources | default([]) | length > 0))
+            else (_network_config.resources | default([]) | first | default({})).spec.networkType | default('OVNKubernetes')
+          }}
+
   roles:
     - role: check_clusterversion
       tags: [check_clusterversion]
@@ -66,6 +99,12 @@
       tags: [check_vm_networking]
     - role: check_live_migration
       tags: [check_live_migration]
+    - role: check_sdn_ovnk
+      tags: [check_sdn_ovnk]
+      when: detected_sdn == 'OVNKubernetes'
+    - role: check_sdn_cilium
+      tags: [check_sdn_cilium]
+      when: detected_sdn == 'Cilium'
 
   post_tasks:
     - name: Ensure report directory exists

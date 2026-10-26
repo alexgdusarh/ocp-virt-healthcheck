@@ -76,6 +76,15 @@ different `KUBECONFIG` — each run produces its own report under `reports/`.
 | 10 | VirtualMachine/VirtualMachineInstance health (printableStatus, phase, Ready) | `oc-commands/10_check_vm_health.sh` | `roles/check_vm_health` |
 | 11 | VM networking: NMState/NNCP, physical NIC consistency per node role, dedicated networks, NAD + VLAN cross-check | `oc-commands/11_check_vm_networking.sh` | `roles/check_vm_networking` |
 | 12 | Live migration readiness (failed/in-flight VMIMs, non-migratable volumes needing LiveMigrate) | `oc-commands/12_check_live_migration.sh` | `roles/check_live_migration` |
+| 13 | SDN - OVN-Kubernetes health (default CNI) | `oc-commands/13_check_sdn_ovnk.sh` | `roles/check_sdn_ovnk` |
+| 14 | SDN - Cilium health (only when Cilium is the detected CNI) | `oc-commands/14_check_sdn_cilium.sh` | `roles/check_sdn_cilium` |
+
+Checks 13/14 are mutually exclusive in Ansible: `site.yaml`'s `pre_tasks`
+detect the cluster's actual CNI (`Network.config.openshift.io/cluster`
+`spec.networkType`) once as `detected_sdn`, and each role's `when:` runs
+only the one that matches — no flag needed. The two `oc` scripts are
+separate per-CNI files; open whichever matches what's actually installed
+on the cluster you're looking at.
 
 ## License
 

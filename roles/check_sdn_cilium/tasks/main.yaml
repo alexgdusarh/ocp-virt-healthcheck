@@ -1,0 +1,173 @@
+---
+# Check: SDN - Cilium
+#
+# Only meaningful when the cluster's detected CNI is Cilium (set as
+# `detected_sdn` by site.yaml's pre_tasks, via CiliumNode CRD
+# existence - the robust signal - not solely Network.config's
+# networkType string, which is a free-form field rather than an
+# enforced enum).
+#
+# PASS only if: the Cilium operator CSV is Succeeded, the cilium
+# DaemonSet is fully ready, every Node has a matching CiliumNode (no
+# orphans on either side), and every cilium agent pod is Running/Ready.
+
+- name: "check_sdn_cilium | Get Cilium operator CSV"
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ k8s_auth_kubeconfig | default(omit) }}"
+    api_token: "{{ k8s_auth_api_token | default(omit) }}"
+    api_version: operators.coreos.com/v1alpha1
+    kind: ClusterServiceVersion
+  register: _all_csvs_cilium
+  ignore_errors: true
+
+- name: "check_sdn_cilium | Get cilium DaemonSet (try kube-system, then cilium namespace)"
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ k8s_auth_kubeconfig | default(omit) }}"
+    api_token: "{{ k8s_auth_api_token | default(omit) }}"
+    api_version: apps/v1
+    kind: DaemonSet
+    name: cilium
+    namespace: "{{ item }}"
+  register: _cilium_ds_lookup
+  loop: ["kube-system", "cilium"]
+  loop_control:
+    label: "{{ item }}"
+  ignore_errors: true
+
+- name: "check_sdn_cilium | Get Nodes"
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ k8s_auth_kubeconfig | default(omit) }}"
+    api_token: "{{ k8s_auth_api_token | default(omit) }}"
+    kind: Node
+  register: _nodes_for_cilium
+  ignore_errors: true
+
+- name: "check_sdn_cilium | Get CiliumNodes"
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ k8s_auth_kubeconfig | default(omit) }}"
+    api_token: "{{ k8s_auth_api_token | default(omit) }}"
+    api_version: cilium.io/v2
+    kind: CiliumNode
+  register: _ciliumnodes
+  ignore_errors: true
+
+- name: "check_sdn_cilium | Get Cilium agent pods (try both namespaces)"
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ k8s_auth_kubeconfig | default(omit) }}"
+    api_token: "{{ k8s_auth_api_token | default(omit) }}"
+    kind: Pod
+    namespace: "{{ item }}"
+    label_selectors:
+      - "k8s-app=cilium"
+  register: _cilium_pods_lookup
+  loop: ["kube-system", "cilium"]
+  loop_control:
+    label: "{{ item }}"
+  ignore_errors: true
+
+- name: "check_sdn_cilium | Reset accumulators"
+  ansible.builtin.set_fact:
+    _cilium_pod_problems: []
+    _ciliumnode_orphans: []
+
+- name: "check_sdn_cilium | Find the Cilium operator CSV"
+  ansible.builtin.set_fact:
+    _cilium_csv: >-
+      {{
+        (_all_csvs_cilium.resources | default([]))
+        | selectattr('metadata.name', 'match', '(?i)^cilium.*')
+        | list | first | default({})
+      }}
+
+- name: "check_sdn_cilium | Pick the cilium DaemonSet that actually exists"
+  ansible.builtin.set_fact:
+    _cilium_ds: >-
+      {{
+        (_cilium_ds_lookup.results | default([]))
+        | rejectattr('failed', 'equalto', true)
+        | map(attribute='resources')
+        | select('defined')
+        | map('first')
+        | select('defined')
+        | list | first | default({})
+      }}
+
+- name: "check_sdn_cilium | Evaluate cilium DaemonSet readiness"
+  ansible.builtin.set_fact:
+    _cilium_ds_desired: "{{ (_cilium_ds.status | default({})).desiredNumberScheduled | default(0) }}"
+    _cilium_ds_ready: "{{ (_cilium_ds.status | default({})).numberReady | default(0) }}"
+
+- name: "check_sdn_cilium | Flatten Cilium agent pods from both namespace lookups"
+  ansible.builtin.set_fact:
+    _cilium_pods: >-
+      {{
+        (_cilium_pods_lookup.results | default([]))
+        | rejectattr('failed', 'equalto', true)
+        | map(attribute='resources')
+        | select('defined')
+        | sum(start=[])
+      }}
+
+- name: "check_sdn_cilium | Flag Cilium pods not Running/Ready"
+  vars:
+    _container_statuses: "{{ item.status.containerStatuses | default([]) }}"
+    _all_ready: "{{ (_container_statuses | map(attribute='ready') | list | unique) == [true] if _container_statuses | length > 0 else false }}"
+  ansible.builtin.set_fact:
+    _cilium_pod_problems: "{{ _cilium_pod_problems + [item.metadata.namespace ~ '/' ~ item.metadata.name ~ ' (phase=' ~ (item.status.phase | default('Unknown')) ~ ')'] }}"
+  loop: "{{ _cilium_pods }}"
+  loop_control:
+    label: "{{ item.metadata.name }}"
+  when: (item.status.phase | default('Unknown')) != 'Running' or not _all_ready
+
+- name: "check_sdn_cilium | Flag Nodes with no matching CiliumNode, and vice versa"
+  vars:
+    _node_names: "{{ _nodes_for_cilium.resources | default([]) | map(attribute='metadata.name') | list }}"
+    _ciliumnode_names: "{{ _ciliumnodes.resources | default([]) | map(attribute='metadata.name') | list }}"
+  ansible.builtin.set_fact:
+    _ciliumnode_orphans: >-
+      {{
+        (_node_names | difference(_ciliumnode_names) | map('regex_replace', '^(.*)$', 'Node \1 has no CiliumNode') | list)
+        + (_ciliumnode_names | difference(_node_names) | map('regex_replace', '^(.*)$', 'CiliumNode \1 has no matching Node') | list)
+      }}
+
+- name: "check_sdn_cilium | Finalize result"
+  vars:
+    _csv_phase: "{{ _cilium_csv.status.phase | default('NotFound') }}"
+    _total_problems: >-
+      {{
+        (_cilium_pod_problems | length | int) + (_ciliumnode_orphans | length | int)
+        + (0 if (_cilium_ds_desired | int) == (_cilium_ds_ready | int) else 1)
+        + (0 if _csv_phase == 'Succeeded' else 1)
+      }}
+  ansible.builtin.set_fact:
+    _sdn_cilium_result:
+      check: check_sdn_cilium
+      status: >-
+        {{
+          'FAIL' if (_total_problems | int > 0) else
+          'PASS'
+        }}
+      message: >-
+        {%- if _total_problems | int > 0 -%}
+        {{ _total_problems }} problem(s) found
+        {%- if _csv_phase != 'Succeeded' %}; Cilium operator CSV phase={{ _csv_phase }}{% endif %}
+        {%- if (_cilium_ds_desired | int) != (_cilium_ds_ready | int) %}; cilium DaemonSet {{ _cilium_ds_ready }}/{{ _cilium_ds_desired }} ready{% endif %}
+        {%- if _ciliumnode_orphans | length > 0 %}; {{ _ciliumnode_orphans | join('; ') }}{% endif %}
+        {%- if _cilium_pod_problems | length > 0 %}; Pods not Running/Ready: {{ _cilium_pod_problems | join('; ') }}{% endif %}
+        {%- else -%}
+        Cilium healthy: operator CSV Succeeded, cilium DaemonSet {{ _cilium_ds_ready }}/{{ _cilium_ds_desired }} ready, every Node has a matching CiliumNode, all agent pods Running/Ready
+        {%- endif -%}
+      data:
+        csv_phase: "{{ _csv_phase }}"
+        ds_ready: "{{ _cilium_ds_ready }}"
+        ds_desired: "{{ _cilium_ds_desired }}"
+        ciliumnode_orphans: "{{ _ciliumnode_orphans }}"
+        pod_problems: "{{ _cilium_pod_problems }}"
+
+- name: "check_sdn_cilium | Record result"
+  ansible.builtin.set_fact:
+    healthcheck_results: "{{ healthcheck_results + [_sdn_cilium_result] }}"
+
+- name: "check_sdn_cilium | Show result"
+  ansible.builtin.debug:
+    var: _sdn_cilium_result
