@@ -54,6 +54,12 @@
       tags: [check_machinesets]
     - role: check_baremetalhosts
       tags: [check_baremetalhosts]
+    - role: check_hco_status
+      tags: [check_hco_status]
+    - role: check_kubevirt_components
+      tags: [check_kubevirt_components]
+    - role: check_cdi_storage
+      tags: [check_cdi_storage]
 
   post_tasks:
     - name: Ensure report directory exists

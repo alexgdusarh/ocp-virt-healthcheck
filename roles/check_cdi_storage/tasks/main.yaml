@@ -1,0 +1,141 @@
+---
+# Check: StorageClass + CDI (Containerized Data Importer) readiness
+#
+# PASS only if: at least one StorageClass exists, the CDI CR reports
+# Available=True/Degraded=False, every cdi.kubevirt.io-labeled
+# Deployment is fully ready/available, and no DataVolume is stuck
+# outside Succeeded/WaitForFirstConsumer.
+
+- name: "check_cdi_storage | Get StorageClasses"
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ k8s_auth_kubeconfig | default(omit) }}"
+    api_token: "{{ k8s_auth_api_token | default(omit) }}"
+    api_version: storage.k8s.io/v1
+    kind: StorageClass
+  register: _storageclasses
+  ignore_errors: true
+
+- name: "check_cdi_storage | Get CDI CR"
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ k8s_auth_kubeconfig | default(omit) }}"
+    api_token: "{{ k8s_auth_api_token | default(omit) }}"
+    api_version: cdi.kubevirt.io/v1beta1
+    kind: CDI
+  register: _cdi
+  ignore_errors: true
+
+- name: "check_cdi_storage | Get CDI Deployments"
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ k8s_auth_kubeconfig | default(omit) }}"
+    api_token: "{{ k8s_auth_api_token | default(omit) }}"
+    api_version: apps/v1
+    kind: Deployment
+    namespace: "{{ cnv_namespace | default('openshift-cnv') }}"
+    label_selectors:
+      - "cdi.kubevirt.io"
+  register: _cdi_deployments
+  ignore_errors: true
+
+- name: "check_cdi_storage | Get DataVolumes (all namespaces)"
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ k8s_auth_kubeconfig | default(omit) }}"
+    api_token: "{{ k8s_auth_api_token | default(omit) }}"
+    api_version: cdi.kubevirt.io/v1beta1
+    kind: DataVolume
+  register: _datavolumes
+  ignore_errors: true
+
+- name: "check_cdi_storage | Reset accumulators"
+  ansible.builtin.set_fact:
+    _cdi_cr_problems: []
+    _cdi_deployment_problems: []
+    _dv_problems: []
+
+- name: "check_cdi_storage | Evaluate CDI CR conditions"
+  vars:
+    _cdi_cr: "{{ (_cdi.resources | default([])) | first | default({}) }}"
+    _cdi_conditions: "{{ (_cdi_cr.status | default({})).conditions | default([]) }}"
+  ansible.builtin.set_fact:
+    _cdi_conditions: "{{ _cdi_conditions }}"
+
+- name: "check_cdi_storage | Flag unhealthy CDI CR conditions"
+  ansible.builtin.set_fact:
+    _cdi_cr_problems: "{{ _cdi_cr_problems + [item.type ~ '=' ~ item.status ~ ' (' ~ (item.reason | default('')) ~ ')'] }}"
+  loop: "{{ _cdi_conditions }}"
+  loop_control:
+    label: "{{ item.type }}"
+  when: >-
+    (item.type == 'Available' and item.status != 'True')
+    or (item.type == 'Degraded' and item.status != 'False')
+
+- name: "check_cdi_storage | Flag CDI Deployments not fully ready/available"
+  ansible.builtin.set_fact:
+    _cdi_deployment_problems: "{{ _cdi_deployment_problems + [item.metadata.name ~ ' (desired=' ~ (item.spec.replicas | default(0)) ~ ' ready=' ~ (item.status.readyReplicas | default(0)) ~ ')'] }}"
+  loop: "{{ _cdi_deployments.resources | default([]) }}"
+  loop_control:
+    label: "{{ item.metadata.name }}"
+  when: >-
+    (item.spec.replicas | default(0)) != (item.status.readyReplicas | default(0))
+    or (item.spec.replicas | default(0)) != (item.status.availableReplicas | default(0))
+
+- name: "check_cdi_storage | Flag stuck/failed DataVolumes"
+  ansible.builtin.set_fact:
+    _dv_problems: "{{ _dv_problems + [item.metadata.namespace ~ '/' ~ item.metadata.name ~ ' (phase=' ~ (item.status.phase | default('Unknown')) ~ ')'] }}"
+  loop: "{{ _datavolumes.resources | default([]) }}"
+  loop_control:
+    label: "{{ item.metadata.name }}"
+  when: (item.status.phase | default('Unknown')) not in ['Succeeded', 'WaitForFirstConsumer']
+
+- name: "check_cdi_storage | Reset default-StorageClass accumulator"
+  ansible.builtin.set_fact:
+    _default_storageclasses: []
+
+- name: "check_cdi_storage | Determine default StorageClass"
+  ansible.builtin.set_fact:
+    _default_storageclasses: "{{ _default_storageclasses + [item.metadata.name] }}"
+  loop: "{{ _storageclasses.resources | default([]) }}"
+  loop_control:
+    label: "{{ item.metadata.name }}"
+  when: (item.metadata.annotations | default({}))['storageclass.kubernetes.io/is-default-class'] | default('false') == 'true'
+
+- name: "check_cdi_storage | Finalize result"
+  vars:
+    _sc_count: "{{ _storageclasses.resources | default([]) | length | int }}"
+    _cdi_present: "{{ (_cdi.resources | default([]) | length | int) > 0 }}"
+    _total_problems: "{{ (0 if (_sc_count | int) > 0 else 1) + (_cdi_cr_problems | length | int) + (_cdi_deployment_problems | length | int) + (_dv_problems | length | int) }}"
+  ansible.builtin.set_fact:
+    _cdi_storage_result:
+      check: check_cdi_storage
+      status: >-
+        {{
+          'FAIL' if ((_sc_count | int) == 0 or not _cdi_present) else
+          'FAIL' if (_total_problems | int > 0) else
+          'PASS'
+        }}
+      message: >-
+        {%- if (_sc_count | int) == 0 -%}
+        No StorageClasses found - VMs cannot provision storage
+        {%- elif not _cdi_present -%}
+        CDI CR not found (CDI may not be installed/enabled)
+        {%- elif _total_problems | int > 0 -%}
+        {{ _total_problems }} problem(s) found
+        {%- if _cdi_cr_problems | length > 0 %}; CDI CR: {{ _cdi_cr_problems | join('; ') }}{% endif %}
+        {%- if _cdi_deployment_problems | length > 0 %}; Deployments not ready: {{ _cdi_deployment_problems | join('; ') }}{% endif %}
+        {%- if _dv_problems | length > 0 %}; DataVolumes stuck/failed: {{ _dv_problems | join('; ') }}{% endif %}
+        {%- else -%}
+        {{ _sc_count }} StorageClass(es) available (default: {{ _default_storageclasses | join(',') if _default_storageclasses | length > 0 else 'NONE SET' }}), CDI healthy, no stuck DataVolumes
+        {%- endif -%}
+      data:
+        storageclass_count: "{{ _sc_count }}"
+        default_storageclasses: "{{ _default_storageclasses }}"
+        cdi_conditions: "{{ _cdi_conditions }}"
+        deployment_problems: "{{ _cdi_deployment_problems }}"
+        datavolume_problems: "{{ _dv_problems }}"
+
+- name: "check_cdi_storage | Record result"
+  ansible.builtin.set_fact:
+    healthcheck_results: "{{ healthcheck_results + [_cdi_storage_result] }}"
+
+- name: "check_cdi_storage | Show result"
+  ansible.builtin.debug:
+    var: _cdi_storage_result

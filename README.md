@@ -7,8 +7,10 @@ run unattended across a fleet of clusters.
 
 ## Layout
 
-- `oc-commands/check_<name>.sh` — one executable script per check, meant to
-  be opened and copy/pasted command-by-command during a live session.
+- `oc-commands/NN_check_<name>.sh` — one executable script per check,
+  prefixed with its check number (`01_`, `02_`, ...) so the dictation
+  order is obvious at a glance; opened and copy/pasted command-by-command
+  during a live session.
 - `roles/check_<name>/` — the equivalent Ansible role, using
   `kubernetes.core.k8s_info` (no shelling out to `oc`).
 - `site.yaml` — runs all checks (or a subset via `--tags`) against one
@@ -30,7 +32,7 @@ for the target cluster.
 
 ```bash
 # oc commands: open and copy/paste from the script for the check you need
-./oc-commands/check_clusterversion.sh
+./oc-commands/01_check_clusterversion.sh
 
 # Ansible: run all checks against the cluster pointed to by KUBECONFIG
 KUBECONFIG=/path/to/cluster.kubeconfig ansible-playbook -i inventory/hosts.yaml site.yaml
@@ -53,14 +55,17 @@ different `KUBECONFIG` — each run produces its own report under `reports/`.
 
 ## Checks implemented
 
-| Check | oc script | Role |
-|---|---|---|
-| ClusterVersion status (version, conditions, TechPreview/FeatureGate) | `oc-commands/check_clusterversion.sh` | `roles/check_clusterversion` |
-| ClusterOperators all Available/steady | `oc-commands/check_clusteroperators.sh` | `roles/check_clusteroperators` |
-| MachineConfigPool members ready/updated | `oc-commands/check_mcp_status.sh` | `roles/check_mcp_status` |
-| Nodes match their pool's rendered MachineConfig | `oc-commands/check_nodes_mcp_render.sh` | `roles/check_nodes_mcp_render` |
-| MachineSets/Machines ready (optional - not present on all bare-metal) | `oc-commands/check_machinesets.sh` | `roles/check_machinesets` |
-| BareMetalHost linkage to Machine/MachineSet/Node (optional - IPI metal3 only) | `oc-commands/check_baremetalhosts.sh` | `roles/check_baremetalhosts` |
+| # | Check | oc script | Role |
+|---|---|---|---|
+| 1 | ClusterVersion status (version, conditions, TechPreview/FeatureGate) | `oc-commands/01_check_clusterversion.sh` | `roles/check_clusterversion` |
+| 2 | ClusterOperators all Available/steady | `oc-commands/02_check_clusteroperators.sh` | `roles/check_clusteroperators` |
+| 3 | MachineConfigPool members ready/updated | `oc-commands/03_check_mcp_status.sh` | `roles/check_mcp_status` |
+| 4 | Nodes match their pool's rendered MachineConfig | `oc-commands/04_check_nodes_mcp_render.sh` | `roles/check_nodes_mcp_render` |
+| 5 | MachineSets/Machines ready (optional - not present on all bare-metal) | `oc-commands/05_check_machinesets.sh` | `roles/check_machinesets` |
+| 6 | BareMetalHost linkage to Machine/MachineSet/Node (optional - IPI metal3 only) | `oc-commands/06_check_baremetalhosts.sh` | `roles/check_baremetalhosts` |
+| 7 | CNV operator (CSV Succeeded) + HyperConverged CR health | `oc-commands/07_check_hco_status.sh` | `roles/check_hco_status` |
+| 8 | KubeVirt CR + virt-api/virt-controller/virt-handler readiness | `oc-commands/08_check_kubevirt_components.sh` | `roles/check_kubevirt_components` |
+| 9 | StorageClass + CDI (DataVolume import) readiness | `oc-commands/09_check_cdi_storage.sh` | `roles/check_cdi_storage` |
 
 ## License
 

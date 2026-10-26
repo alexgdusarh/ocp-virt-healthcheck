@@ -15,3 +15,8 @@ k8s_auth_api_token: "{{ lookup('env', 'K8S_AUTH_API_TOKEN') | default(omit, true
 
 # Where each check writes its per-cluster JSON report.
 healthcheck_report_dir: "{{ playbook_dir }}/reports"
+
+# Namespace OpenShift Virtualization (CNV) is installed into. Standard
+# installs use "openshift-cnv"; override with -e cnv_namespace=... for a
+# non-default install rather than hard-coding it with no escape hatch.
+cnv_namespace: openshift-cnv

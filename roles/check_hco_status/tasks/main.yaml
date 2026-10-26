@@ -1,0 +1,104 @@
+---
+# Check: OpenShift Virtualization (CNV) operator + HyperConverged CR
+#
+# Foundation check for every other OCP-Virt check: is the operator
+# installed (CSV Succeeded) and does the HyperConverged CR report
+# Available=True, Degraded=False, Progressing=False,
+# ReconcileComplete=True.
+#
+# The CNV namespace defaults to "openshift-cnv" (the standard install
+# namespace) but is overridable via -e cnv_namespace=... for a
+# non-default install, rather than hard-coding it with no escape hatch.
+
+- name: "check_hco_status | Get CNV ClusterServiceVersions"
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ k8s_auth_kubeconfig | default(omit) }}"
+    api_token: "{{ k8s_auth_api_token | default(omit) }}"
+    api_version: operators.coreos.com/v1alpha1
+    kind: ClusterServiceVersion
+    namespace: "{{ cnv_namespace | default('openshift-cnv') }}"
+  register: _csv
+  ignore_errors: true
+
+- name: "check_hco_status | Get HyperConverged CR"
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ k8s_auth_kubeconfig | default(omit) }}"
+    api_token: "{{ k8s_auth_api_token | default(omit) }}"
+    api_version: hco.kubevirt.io/v1beta1
+    kind: HyperConverged
+    name: kubevirt-hyperconverged
+    namespace: "{{ cnv_namespace | default('openshift-cnv') }}"
+  register: _hco
+  ignore_errors: true
+
+- name: "check_hco_status | Reset accumulators"
+  ansible.builtin.set_fact:
+    _hco_condition_problems: []
+
+- name: "check_hco_status | Find the CNV CSV"
+  ansible.builtin.set_fact:
+    _cnv_csv: >-
+      {{
+        (_csv.resources | default([]))
+        | selectattr('metadata.name', 'match', '^kubevirt-hyperconverged-operator.*')
+        | list | first | default({})
+      }}
+
+- name: "check_hco_status | Evaluate HCO conditions"
+  vars:
+    _hco_status: "{{ (_hco.resources | default([]) | first | default({})).status | default({}) }}"
+    _conditions: "{{ _hco_status.conditions | default([]) }}"
+  ansible.builtin.set_fact:
+    _hco_conditions: "{{ _conditions }}"
+    _hco_versions: "{{ _hco_status.versions | default([]) }}"
+
+- name: "check_hco_status | Flag unhealthy HCO conditions"
+  ansible.builtin.set_fact:
+    _hco_condition_problems: "{{ _hco_condition_problems + [item.type ~ '=' ~ item.status ~ ' (' ~ (item.reason | default('')) ~ ')'] }}"
+  loop: "{{ _hco_conditions }}"
+  loop_control:
+    label: "{{ item.type }}"
+  when: >-
+    (item.type == 'Available' and item.status != 'True')
+    or (item.type == 'Degraded' and item.status != 'False')
+    or (item.type == 'Progressing' and item.status != 'False')
+    or (item.type == 'ReconcileComplete' and item.status != 'True')
+
+- name: "check_hco_status | Finalize result"
+  vars:
+    _hco_present: "{{ (_hco.resources | default([]) | length) > 0 }}"
+    _csv_phase: "{{ _cnv_csv.status.phase | default('NotFound') }}"
+  ansible.builtin.set_fact:
+    _hco_status_result:
+      check: check_hco_status
+      status: >-
+        {{
+          'FAIL' if (not _hco_present or _csv_phase != 'Succeeded') else
+          'FAIL' if (_hco_condition_problems | length > 0) else
+          'PASS'
+        }}
+      message: >-
+        {%- if not _hco_present -%}
+        HyperConverged CR not found in namespace {{ cnv_namespace | default('openshift-cnv') }} (OCP-Virt may not be installed)
+        {%- elif _csv_phase != 'Succeeded' -%}
+        CNV ClusterServiceVersion phase is '{{ _csv_phase }}', not Succeeded
+        {%- elif _hco_condition_problems | length > 0 -%}
+        HyperConverged CR unhealthy: {{ _hco_condition_problems | join('; ') }}
+        {%- else -%}
+        CNV operator installed (CSV {{ _cnv_csv.metadata.name | default('unknown') }}, v{{ _cnv_csv.spec.version | default('unknown') }}), HyperConverged CR healthy
+        {%- endif -%}
+      data:
+        csv_name: "{{ _cnv_csv.metadata.name | default(none) }}"
+        csv_version: "{{ _cnv_csv.spec.version | default(none) }}"
+        csv_phase: "{{ _csv_phase }}"
+        hco_conditions: "{{ _hco_conditions }}"
+        hco_versions: "{{ _hco_versions }}"
+        problems: "{{ _hco_condition_problems }}"
+
+- name: "check_hco_status | Record result"
+  ansible.builtin.set_fact:
+    healthcheck_results: "{{ healthcheck_results + [_hco_status_result] }}"
+
+- name: "check_hco_status | Show result"
+  ansible.builtin.debug:
+    var: _hco_status_result

@@ -1,0 +1,149 @@
+---
+# Check: KubeVirt CR status + virt-handler/virt-api/virt-controller pods
+#
+# PASS only if the KubeVirt CR reports Available=True/Degraded=False/
+# Progressing=False, every kubevirt.io-labeled Deployment is fully
+# ready/available, the virt-handler DaemonSet has numberReady ==
+# desiredNumberScheduled, and every kubevirt.io-labeled pod is Running
+# with all containers ready.
+
+- name: "check_kubevirt_components | Get KubeVirt CR"
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ k8s_auth_kubeconfig | default(omit) }}"
+    api_token: "{{ k8s_auth_api_token | default(omit) }}"
+    api_version: kubevirt.io/v1
+    kind: KubeVirt
+    namespace: "{{ cnv_namespace | default('openshift-cnv') }}"
+  register: _kv
+  ignore_errors: true
+
+- name: "check_kubevirt_components | Get kubevirt.io Deployments"
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ k8s_auth_kubeconfig | default(omit) }}"
+    api_token: "{{ k8s_auth_api_token | default(omit) }}"
+    api_version: apps/v1
+    kind: Deployment
+    namespace: "{{ cnv_namespace | default('openshift-cnv') }}"
+    label_selectors:
+      - "kubevirt.io"
+  register: _kv_deployments
+  ignore_errors: true
+
+- name: "check_kubevirt_components | Get virt-handler DaemonSet"
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ k8s_auth_kubeconfig | default(omit) }}"
+    api_token: "{{ k8s_auth_api_token | default(omit) }}"
+    api_version: apps/v1
+    kind: DaemonSet
+    name: virt-handler
+    namespace: "{{ cnv_namespace | default('openshift-cnv') }}"
+  register: _virt_handler
+  ignore_errors: true
+
+- name: "check_kubevirt_components | Get kubevirt.io Pods"
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ k8s_auth_kubeconfig | default(omit) }}"
+    api_token: "{{ k8s_auth_api_token | default(omit) }}"
+    kind: Pod
+    namespace: "{{ cnv_namespace | default('openshift-cnv') }}"
+    label_selectors:
+      - "kubevirt.io"
+  register: _kv_pods
+  ignore_errors: true
+
+- name: "check_kubevirt_components | Reset accumulators"
+  ansible.builtin.set_fact:
+    _kv_cr_problems: []
+    _kv_deployment_problems: []
+    _kv_pod_problems: []
+
+- name: "check_kubevirt_components | Evaluate KubeVirt CR conditions"
+  vars:
+    _kv_cr: "{{ (_kv.resources | default([])) | first | default({}) }}"
+    _kv_conditions: "{{ (_kv_cr.status | default({})).conditions | default([]) }}"
+  ansible.builtin.set_fact:
+    _kv_cr_conditions: "{{ _kv_conditions }}"
+    _kv_observed_version: "{{ (_kv_cr.status | default({})).observedKubeVirtVersion | default('unknown') }}"
+
+- name: "check_kubevirt_components | Flag unhealthy KubeVirt CR conditions"
+  ansible.builtin.set_fact:
+    _kv_cr_problems: "{{ _kv_cr_problems + [item.type ~ '=' ~ item.status ~ ' (' ~ (item.reason | default('')) ~ ')'] }}"
+  loop: "{{ _kv_cr_conditions }}"
+  loop_control:
+    label: "{{ item.type }}"
+  when: >-
+    (item.type == 'Available' and item.status != 'True')
+    or (item.type == 'Degraded' and item.status != 'False')
+    or (item.type == 'Progressing' and item.status != 'False')
+
+- name: "check_kubevirt_components | Flag Deployments not fully ready/available"
+  ansible.builtin.set_fact:
+    _kv_deployment_problems: "{{ _kv_deployment_problems + [item.metadata.name ~ ' (desired=' ~ (item.spec.replicas | default(0)) ~ ' ready=' ~ (item.status.readyReplicas | default(0)) ~ ' available=' ~ (item.status.availableReplicas | default(0)) ~ ')'] }}"
+  loop: "{{ _kv_deployments.resources | default([]) }}"
+  loop_control:
+    label: "{{ item.metadata.name }}"
+  when: >-
+    (item.spec.replicas | default(0)) != (item.status.readyReplicas | default(0))
+    or (item.spec.replicas | default(0)) != (item.status.availableReplicas | default(0))
+
+- name: "check_kubevirt_components | Flag virt-handler not fully ready"
+  vars:
+    _vh: "{{ (_virt_handler.resources | default([])) | first | default({}) }}"
+    _vh_desired: "{{ (_vh.status | default({})).desiredNumberScheduled | default(0) }}"
+    _vh_ready: "{{ (_vh.status | default({})).numberReady | default(0) }}"
+  ansible.builtin.set_fact:
+    _virt_handler_problem: "{{ ('virt-handler ready=' ~ _vh_ready ~ ' desired=' ~ _vh_desired) if _vh_desired != _vh_ready else none }}"
+    _virt_handler_desired: "{{ _vh_desired }}"
+    _virt_handler_ready: "{{ _vh_ready }}"
+
+- name: "check_kubevirt_components | Flag Pods not Running/Ready"
+  vars:
+    _container_statuses: "{{ item.status.containerStatuses | default([]) }}"
+    _all_ready: "{{ (_container_statuses | map(attribute='ready') | list | unique) == [true] if _container_statuses | length > 0 else false }}"
+  ansible.builtin.set_fact:
+    _kv_pod_problems: "{{ _kv_pod_problems + [item.metadata.name ~ ' (phase=' ~ (item.status.phase | default('Unknown')) ~ ')'] }}"
+  loop: "{{ _kv_pods.resources | default([]) }}"
+  loop_control:
+    label: "{{ item.metadata.name }}"
+  when: (item.status.phase | default('Unknown')) != 'Running' or not _all_ready
+
+- name: "check_kubevirt_components | Finalize result"
+  vars:
+    _kv_present: "{{ (_kv.resources | default([]) | length) > 0 }}"
+    _total_problems: "{{ _kv_cr_problems | length + _kv_deployment_problems | length + (1 if _virt_handler_problem else 0) + _kv_pod_problems | length }}"
+  ansible.builtin.set_fact:
+    _kubevirt_components_result:
+      check: check_kubevirt_components
+      status: >-
+        {{
+          'FAIL' if (not _kv_present) else
+          'FAIL' if (_total_problems | int > 0) else
+          'PASS'
+        }}
+      message: >-
+        {%- if not _kv_present -%}
+        KubeVirt CR not found in namespace {{ cnv_namespace | default('openshift-cnv') }}
+        {%- elif _total_problems | int > 0 -%}
+        {{ _total_problems }} problem(s) found
+        {%- if _kv_cr_problems | length > 0 %}; KubeVirt CR: {{ _kv_cr_problems | join('; ') }}{% endif %}
+        {%- if _kv_deployment_problems | length > 0 %}; Deployments not ready: {{ _kv_deployment_problems | join('; ') }}{% endif %}
+        {%- if _virt_handler_problem %}; {{ _virt_handler_problem }}{% endif %}
+        {%- if _kv_pod_problems | length > 0 %}; Pods not Running/Ready: {{ _kv_pod_problems | join('; ') }}{% endif %}
+        {%- else -%}
+        KubeVirt {{ _kv_observed_version }} healthy: all Deployments ready, virt-handler {{ _virt_handler_ready }}/{{ _virt_handler_desired }} ready, all pods Running/Ready
+        {%- endif -%}
+      data:
+        observed_version: "{{ _kv_observed_version }}"
+        kv_conditions: "{{ _kv_cr_conditions }}"
+        deployment_problems: "{{ _kv_deployment_problems }}"
+        virt_handler_ready: "{{ _virt_handler_ready }}"
+        virt_handler_desired: "{{ _virt_handler_desired }}"
+        pod_problems: "{{ _kv_pod_problems }}"
+
+- name: "check_kubevirt_components | Record result"
+  ansible.builtin.set_fact:
+    healthcheck_results: "{{ healthcheck_results + [_kubevirt_components_result] }}"
+
+- name: "check_kubevirt_components | Show result"
+  ansible.builtin.debug:
+    var: _kubevirt_components_result
