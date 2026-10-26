@@ -91,6 +91,7 @@ different `KUBECONFIG` — each run produces its own report under `reports/`.
 | 16 | HyperConverged config sanity (pre-workload): liveMigrationConfig, workloadUpdateStrategy, defaultCPUModel vs. node CPU diversity | `oc-commands/16_check_hco_config_sanity.sh` | `roles/check_hco_config_sanity` |
 | 17 | Node readiness for VM scheduling (pre-workload): Ready, cordon, kubevirt.io/schedulable, KVM device, drain taint | `oc-commands/17_check_node_vm_readiness.sh` | `roles/check_node_vm_readiness` |
 | 18 | MTV (Migration Toolkit for Virtualization / Forklift) operator health (optional - PASS if not installed) | `oc-commands/18_check_mtv_status.sh` | `roles/check_mtv_status` |
+| 19 | Capacity inventory (pre-workload, informational): CPU/memory/hugepages Capacity vs. Allocatable, per node and summed cluster-wide + for the kubevirt.io/schedulable pool | `oc-commands/19_check_capacity_inventory.sh` | `roles/check_capacity_inventory` |
 
 MTV is the component that migrates VMs INTO OpenShift Virtualization
 from external sources (vSphere, oVirt/RHV, OpenStack, OVA) - a separate
@@ -101,6 +102,18 @@ the operator CSV, its Deployments, and every `Provider`/`NetworkMap`/
 (`Ready`, `ConnectionTestSucceeded`, `InventoryCreated`), and surfaces
 the specific critical-category condition (e.g. `ConnectionAuthFailed`,
 `SecretNotValid`) when a Provider isn't Ready.
+
+Check 19 is informational rather than a strict PASS/FAIL health check -
+it reports what capacity actually exists (no "requested" computation,
+since on a pre-workload/white-canvas cluster that number isn't
+meaningful yet). It WARNs only if zero nodes are labeled
+`kubevirt.io/schedulable=true` (OpenShift Virtualization may not be
+installed/ready). Kubernetes `resource.Quantity` memory values are
+**not** guaranteed to use a `Ki` suffix (verified: kubelet canonicalizes
+to the largest binary-SI suffix that divides the byte count evenly, so
+a node could legitimately report `4Gi` instead of `...Ki`) - both the
+`oc` script's jq and the Ansible role convert Ki/Mi/Gi/Ti explicitly
+rather than assuming one fixed suffix.
 
 Checks 16/17 are pre-workload checks: pure configuration/infrastructure
 review that doesn't require any VirtualMachine to exist yet - useful for

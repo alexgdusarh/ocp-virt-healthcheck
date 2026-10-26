@@ -113,6 +113,8 @@
       tags: [check_node_vm_readiness]
     - role: check_mtv_status
       tags: [check_mtv_status]
+    - role: check_capacity_inventory
+      tags: [check_capacity_inventory]
 
   post_tasks:
     - name: Ensure report directory exists

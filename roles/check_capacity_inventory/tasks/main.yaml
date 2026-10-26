@@ -1,0 +1,118 @@
+---
+# Check: Capacity inventory (pre-workload)
+#
+# Informational, not a PASS/FAIL health check: reports Capacity vs.
+# Allocatable CPU, memory, and hugepages per node, summed both
+# cluster-wide and for the kubevirt.io/schedulable=true pool
+# specifically (the nodes VMs will actually land on). No requested-
+# vs-available computation - this is meant for a pre-workload/
+# white-canvas cluster where that number is not yet meaningful.
+#
+# Kubernetes resource.Quantity values can be serialized in different
+# units (Ki/Mi/Gi for memory, plain cores or a milli- "m" suffix for
+# CPU) - this role converts explicitly per unit rather than assuming
+# one fixed suffix, so it stays correct regardless of how a given
+# cluster/kubelet version happens to format these fields.
+
+- name: "check_capacity_inventory | Get Nodes"
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ k8s_auth_kubeconfig | default(omit) }}"
+    api_token: "{{ k8s_auth_api_token | default(omit) }}"
+    kind: Node
+  register: _nodes_capacity
+  ignore_errors: true
+
+- name: "check_capacity_inventory | Reset accumulators"
+  ansible.builtin.set_fact:
+    _node_capacity_summary: []
+
+- name: "check_capacity_inventory | Build per-node capacity summary (unit-normalized)"
+  vars:
+    _cpu_alloc_raw: "{{ item.status.allocatable.cpu | default('0') }}"
+    _cpu_alloc_millicores: >-
+      {{
+        (_cpu_alloc_raw | regex_replace('m$', '') | int) if _cpu_alloc_raw.endswith('m') else
+        ((_cpu_alloc_raw | float) * 1000 | round | int)
+      }}
+    _mem_alloc_raw: "{{ item.status.allocatable.memory | default('0') }}"
+    _mem_alloc_ki: >-
+      {{
+        (_mem_alloc_raw | regex_replace('Ki$', '') | int) if _mem_alloc_raw.endswith('Ki') else
+        (((_mem_alloc_raw | regex_replace('Mi$', '') | int) * 1024) if _mem_alloc_raw.endswith('Mi') else
+        (((_mem_alloc_raw | regex_replace('Gi$', '') | int) * 1024 * 1024) if _mem_alloc_raw.endswith('Gi') else
+        ((_mem_alloc_raw | int) / 1024 | round | int)))
+      }}
+    _hugepages: >-
+      {{
+        (item.status.allocatable | default({}))
+        | dict2items
+        | selectattr('key', 'match', '^hugepages-.*')
+        | rejectattr('value', 'equalto', '0')
+        | list
+      }}
+    _is_schedulable: "{{ ((item.metadata.labels | default({}))['kubevirt.io/schedulable'] | default('false')) == 'true' }}"
+  ansible.builtin.set_fact:
+    _node_capacity_summary: >-
+      {{
+        _node_capacity_summary + [{
+          'node': item.metadata.name,
+          'kubevirt_schedulable': _is_schedulable,
+          'cpu_allocatable_millicores': (_cpu_alloc_millicores | int),
+          'memory_allocatable_ki': (_mem_alloc_ki | int),
+          'hugepages': _hugepages
+        }]
+      }}
+  loop: "{{ _nodes_capacity.resources | default([]) }}"
+  loop_control:
+    label: "{{ item.metadata.name }}"
+
+- name: "check_capacity_inventory | Sum cluster-wide totals (all nodes)"
+  ansible.builtin.set_fact:
+    _cluster_cpu_millicores: "{{ _node_capacity_summary | map(attribute='cpu_allocatable_millicores') | sum }}"
+    _cluster_mem_ki: "{{ _node_capacity_summary | map(attribute='memory_allocatable_ki') | sum }}"
+
+- name: "check_capacity_inventory | Sum totals for kubevirt.io/schedulable=true nodes only"
+  vars:
+    _schedulable_nodes: "{{ _node_capacity_summary | selectattr('kubevirt_schedulable', 'equalto', true) | list }}"
+  ansible.builtin.set_fact:
+    _schedulable_node_count: "{{ _schedulable_nodes | length }}"
+    _schedulable_cpu_millicores: "{{ _schedulable_nodes | map(attribute='cpu_allocatable_millicores') | sum }}"
+    _schedulable_mem_ki: "{{ _schedulable_nodes | map(attribute='memory_allocatable_ki') | sum }}"
+
+- name: "check_capacity_inventory | Finalize result"
+  vars:
+    _total_nodes: "{{ _node_capacity_summary | length }}"
+    _cluster_cpu_cores: "{{ (_cluster_cpu_millicores | int) / 1000 }}"
+    _cluster_mem_gi: "{{ ((_cluster_mem_ki | int) / 1024 / 1024) | round(1) }}"
+    _schedulable_cpu_cores: "{{ (_schedulable_cpu_millicores | int) / 1000 }}"
+    _schedulable_mem_gi: "{{ ((_schedulable_mem_ki | int) / 1024 / 1024) | round(1) }}"
+  ansible.builtin.set_fact:
+    _capacity_inventory_result:
+      check: check_capacity_inventory
+      status: >-
+        {{
+          'WARN' if ((_schedulable_node_count | int) == 0) else
+          'PASS'
+        }}
+      message: >-
+        {%- if (_schedulable_node_count | int) == 0 -%}
+        No nodes labeled kubevirt.io/schedulable=true found (cluster: {{ _total_nodes }} node(s), {{ _cluster_cpu_cores }} cores, {{ _cluster_mem_gi }}Gi allocatable) - OpenShift Virtualization may not be installed/ready yet
+        {%- else -%}
+        {{ _total_nodes }} node(s) total ({{ _cluster_cpu_cores }} cores, {{ _cluster_mem_gi }}Gi allocatable); {{ _schedulable_node_count }} VM-schedulable node(s) ({{ _schedulable_cpu_cores }} cores, {{ _schedulable_mem_gi }}Gi allocatable)
+        {%- endif -%}
+      data:
+        total_nodes: "{{ _total_nodes }}"
+        cluster_cpu_cores_allocatable: "{{ _cluster_cpu_cores }}"
+        cluster_memory_gi_allocatable: "{{ _cluster_mem_gi }}"
+        schedulable_node_count: "{{ _schedulable_node_count }}"
+        schedulable_cpu_cores_allocatable: "{{ _schedulable_cpu_cores }}"
+        schedulable_memory_gi_allocatable: "{{ _schedulable_mem_gi }}"
+        nodes: "{{ _node_capacity_summary }}"
+
+- name: "check_capacity_inventory | Record result"
+  ansible.builtin.set_fact:
+    healthcheck_results: "{{ healthcheck_results + [_capacity_inventory_result] }}"
+
+- name: "check_capacity_inventory | Show result"
+  ansible.builtin.debug:
+    var: _capacity_inventory_result
