@@ -1,0 +1,5 @@
+reports/*.json
+*.kubeconfig
+kubeconfig*
+.vault_pass
+*.retry

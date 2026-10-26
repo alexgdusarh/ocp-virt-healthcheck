@@ -1,0 +1,74 @@
+---
+# Check: ClusterVersion status
+#
+# Verifies the cluster is on a known version, not Degraded/Failing, and
+# not running under a TechPreviewNoUpgrade (or other non-default)
+# FeatureGate, since that affects upgrade eligibility and the support
+# status of anything layered on top (including OpenShift Virtualization).
+
+- name: "check_clusterversion | Get ClusterVersion status"
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ k8s_auth_kubeconfig | default(omit) }}"
+    api_token: "{{ k8s_auth_api_token | default(omit) }}"
+    api_version: config.openshift.io/v1
+    kind: ClusterVersion
+    name: version
+  register: _cv
+
+- name: "check_clusterversion | Get FeatureGate status"
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ k8s_auth_kubeconfig | default(omit) }}"
+    api_token: "{{ k8s_auth_api_token | default(omit) }}"
+    api_version: config.openshift.io/v1
+    kind: FeatureGate
+    name: cluster
+  register: _fg
+
+- name: "check_clusterversion | Evaluate result"
+  vars:
+    _cv_status: "{{ _cv.resources[0].status | default({}) }}"
+    _cv_conditions: "{{ _cv_status.conditions | default([]) }}"
+    _cv_version: "{{ _cv_status.desired.version | default('unknown') }}"
+    _cv_channel: "{{ _cv.resources[0].spec.channel | default('unknown') }}"
+    _degraded: "{{ _cv_conditions | selectattr('type', 'equalto', 'Degraded') | selectattr('status', 'equalto', 'True') | list }}"
+    _failing: "{{ _cv_conditions | selectattr('type', 'equalto', 'Failing') | selectattr('status', 'equalto', 'True') | list }}"
+    _available: "{{ _cv_conditions | selectattr('type', 'equalto', 'Available') | selectattr('status', 'equalto', 'True') | list }}"
+    _progressing: "{{ _cv_conditions | selectattr('type', 'equalto', 'Progressing') | selectattr('status', 'equalto', 'True') | list }}"
+    _feature_set: "{{ _fg.resources[0].spec.featureSet | default('') }}"
+  ansible.builtin.set_fact:
+    _clusterversion_result:
+      check: check_clusterversion
+      status: >-
+        {{
+          'FAIL' if (_cv.resources | default([]) | length == 0) else
+          'FAIL' if (_degraded | length > 0 or _failing | length > 0) else
+          'WARN' if (_feature_set != '') else
+          'WARN' if (_available | length == 0) else
+          'PASS'
+        }}
+      message: >-
+        {%- if _cv.resources | default([]) | length == 0 -%}
+        Unable to read ClusterVersion (insufficient permissions or API unreachable)
+        {%- elif _degraded | length > 0 or _failing | length > 0 -%}
+        version {{ _cv_version }} (channel {{ _cv_channel }}) is Degraded/Failing
+        {%- elif _feature_set != '' -%}
+        version {{ _cv_version }} (channel {{ _cv_channel }}) OK, but featureSet={{ _feature_set }} (non-default FeatureGate, may block upgrades)
+        {%- elif _available | length == 0 -%}
+        version {{ _cv_version }} (channel {{ _cv_channel }}) is not reporting Available=True
+        {%- else -%}
+        version {{ _cv_version }} (channel {{ _cv_channel }}) Available, default featureSet, no upgrade blockers detected
+        {%- endif -%}
+      data:
+        version: "{{ _cv_version }}"
+        channel: "{{ _cv_channel }}"
+        conditions: "{{ _cv_conditions }}"
+        feature_set: "{{ _feature_set if _feature_set != '' else 'Default' }}"
+        progressing: "{{ _progressing | length > 0 }}"
+
+- name: "check_clusterversion | Record result"
+  ansible.builtin.set_fact:
+    healthcheck_results: "{{ healthcheck_results + [_clusterversion_result] }}"
+
+- name: "check_clusterversion | Show result"
+  ansible.builtin.debug:
+    var: _clusterversion_result

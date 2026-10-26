@@ -1,0 +1,17 @@
+# Cluster connection settings for the OCP Virtualization health check.
+#
+# Resolution order (first non-empty wins), matching how kubernetes.core
+# modules natively resolve auth:
+#   1. -e k8s_auth_api_token=<token>   (explicit flag override)
+#   2. K8S_AUTH_API_TOKEN env var      (optional token via env var)
+#   3. KUBECONFIG env var / ~/.kube/config (default session kubeconfig)
+#
+# k8s_auth_kubeconfig/k8s_auth_api_token are left undefined (null) unless
+# overridden, so kubernetes.core.k8s_info falls back to its own
+# KUBECONFIG/in-cluster/token resolution instead of us hard-coding a path.
+
+k8s_auth_kubeconfig: "{{ lookup('env', 'KUBECONFIG') | default(omit, true) }}"
+k8s_auth_api_token: "{{ lookup('env', 'K8S_AUTH_API_TOKEN') | default(omit, true) }}"
+
+# Where each check writes its per-cluster JSON report.
+healthcheck_report_dir: "{{ playbook_dir }}/reports"

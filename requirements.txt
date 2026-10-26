@@ -1,0 +1,10 @@
+# Install into a virtualenv (see README "Requirements"):
+#   pip install -r requirements.txt
+# ansible-core 2.16+ (needs Python 3.10+) is what current kubernetes.core
+# releases officially support.
+ansible-core>=2.16
+jinja2>=3.1
+kubernetes>=27.2.0
+websocket-client>=1.6.0
+PyYAML>=6.0
+jmespath>=1.0.1
