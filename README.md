@@ -10,7 +10,10 @@ run unattended across a fleet of clusters.
 - `oc-commands/NN_check_<name>.sh` — one executable script per check,
   prefixed with its check number (`01_`, `02_`, ...) so the dictation
   order is obvious at a glance; opened and copy/pasted command-by-command
-  during a live session.
+  during a live session. `00_collect_mustgather.sh` is the one exception
+  to the numbering-matches-a-check rule: it's a diagnostic *collection*
+  step with no PASS/FAIL verdict, meant to be run first, and has no
+  Ansible-side equivalent (see below).
 - `roles/check_<name>/` — the equivalent Ansible role, using
   `kubernetes.core.k8s_info` (no shelling out to `oc`).
 - `site.yaml` — runs all checks (or a subset via `--tags`) against one
@@ -38,6 +41,11 @@ Assumes you're already logged in (`oc login`) or have a valid `KUBECONFIG`
 for the target cluster.
 
 ```bash
+# Collect a must-gather first (general + OpenShift Virtualization), pinned
+# to the cluster's actual OCP/CNV minor version - check it first, don't guess:
+oc get clusterversion version -o jsonpath='{.status.desired.version}{"\n"}'
+OCP_VERSION=4.20 ./oc-commands/00_collect_mustgather.sh   # or 4.22, etc.
+
 # oc commands: open and copy/paste from the script for the check you need
 ./oc-commands/01_check_clusterversion.sh
 
@@ -64,6 +72,7 @@ different `KUBECONFIG` — each run produces its own report under `reports/`.
 
 | # | Check | oc script | Role |
 |---|---|---|---|
+| 0 | must-gather collection (general + OpenShift Virtualization) - run first, no PASS/FAIL verdict, no Ansible role | `oc-commands/00_collect_mustgather.sh` | *(none - oc-script only)* |
 | 1 | ClusterVersion status (version, conditions, TechPreview/FeatureGate) | `oc-commands/01_check_clusterversion.sh` | `roles/check_clusterversion` |
 | 2 | ClusterOperators all Available/steady | `oc-commands/02_check_clusteroperators.sh` | `roles/check_clusteroperators` |
 | 3 | MachineConfigPool members ready/updated | `oc-commands/03_check_mcp_status.sh` | `roles/check_mcp_status` |
