@@ -90,6 +90,17 @@ different `KUBECONFIG` — each run produces its own report under `reports/`.
 | 15 | Storage - NetApp Trident CSI / ONTAP (basic; optional - PASS if not installed) | `oc-commands/15_check_storage_trident.sh` | `roles/check_storage_trident` |
 | 16 | HyperConverged config sanity (pre-workload): liveMigrationConfig, workloadUpdateStrategy, defaultCPUModel vs. node CPU diversity | `oc-commands/16_check_hco_config_sanity.sh` | `roles/check_hco_config_sanity` |
 | 17 | Node readiness for VM scheduling (pre-workload): Ready, cordon, kubevirt.io/schedulable, KVM device, drain taint | `oc-commands/17_check_node_vm_readiness.sh` | `roles/check_node_vm_readiness` |
+| 18 | MTV (Migration Toolkit for Virtualization / Forklift) operator health (optional - PASS if not installed) | `oc-commands/18_check_mtv_status.sh` | `roles/check_mtv_status` |
+
+MTV is the component that migrates VMs INTO OpenShift Virtualization
+from external sources (vSphere, oVirt/RHV, OpenStack, OVA) - a separate
+OLM operator (`forklift.konveyor.io/v1beta1` CRDs, namespace
+`openshift-mtv` by convention), not part of CNV itself. Check 18 checks
+the operator CSV, its Deployments, and every `Provider`/`NetworkMap`/
+`StorageMap`'s `Ready` condition using MTV's own CRD printcolumns
+(`Ready`, `ConnectionTestSucceeded`, `InventoryCreated`), and surfaces
+the specific critical-category condition (e.g. `ConnectionAuthFailed`,
+`SecretNotValid`) when a Provider isn't Ready.
 
 Checks 16/17 are pre-workload checks: pure configuration/infrastructure
 review that doesn't require any VirtualMachine to exist yet - useful for

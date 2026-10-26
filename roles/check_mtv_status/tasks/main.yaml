@@ -1,0 +1,185 @@
+---
+# Check: MTV (Migration Toolkit for Virtualization / Forklift) operator health
+#
+# MTV is a separate OLM operator (forklift.konveyor.io/v1beta1 CRDs,
+# namespace openshift-mtv by convention) installed to migrate VMs INTO
+# OpenShift Virtualization from external sources. Optional - PASS with
+# an informational message if not installed, matching the pattern used
+# for MachineSets/BareMetalHosts/NMState/Trident elsewhere.
+#
+# A Provider is healthy when its Ready condition is True (which MTV
+# itself only sets True once ConnectionTestSucceeded and
+# InventoryCreated are also True) - critical-category conditions
+# (ConnectionAuthFailed, ConnectionTestFailed, SecretNotValid,
+# UrlNotValid, ProviderTypeNotSupported, SettingsNotValid) are
+# surfaced by name/reason when present and True.
+
+- name: "check_mtv_status | Check for Provider CRD (presence)"
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ k8s_auth_kubeconfig | default(omit) }}"
+    api_token: "{{ k8s_auth_api_token | default(omit) }}"
+    api_version: apiextensions.k8s.io/v1
+    kind: CustomResourceDefinition
+    name: providers.forklift.konveyor.io
+  register: _mtv_crd
+  ignore_errors: true
+
+- name: "check_mtv_status | MTV not installed - record PASS and skip"
+  when: (_mtv_crd.failed | default(false)) or (_mtv_crd.resources | default([]) | length == 0)
+  block:
+    - name: "check_mtv_status | Record not-installed result"
+      ansible.builtin.set_fact:
+        _mtv_status_result:
+          check: check_mtv_status
+          status: PASS
+          message: "forklift.konveyor.io CRDs not present - MTV is not installed on this cluster"
+          data: {}
+
+    - name: "check_mtv_status | Append and show not-installed result"
+      ansible.builtin.set_fact:
+        healthcheck_results: "{{ healthcheck_results + [_mtv_status_result] }}"
+
+    - name: "check_mtv_status | Show not-installed result"
+      ansible.builtin.debug:
+        var: _mtv_status_result
+
+- name: "check_mtv_status | MTV is present - run real checks"
+  when: not ((_mtv_crd.failed | default(false)) or (_mtv_crd.resources | default([]) | length == 0))
+  block:
+    - name: "check_mtv_status | Get mtv-operator CSV"
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ k8s_auth_kubeconfig | default(omit) }}"
+        api_token: "{{ k8s_auth_api_token | default(omit) }}"
+        api_version: operators.coreos.com/v1alpha1
+        kind: ClusterServiceVersion
+        namespace: "{{ mtv_namespace | default('openshift-mtv') }}"
+      register: _mtv_csvs
+      ignore_errors: true
+
+    - name: "check_mtv_status | Get MTV Deployments"
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ k8s_auth_kubeconfig | default(omit) }}"
+        api_token: "{{ k8s_auth_api_token | default(omit) }}"
+        api_version: apps/v1
+        kind: Deployment
+        namespace: "{{ mtv_namespace | default('openshift-mtv') }}"
+      register: _mtv_deployments
+      ignore_errors: true
+
+    - name: "check_mtv_status | Get Providers"
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ k8s_auth_kubeconfig | default(omit) }}"
+        api_token: "{{ k8s_auth_api_token | default(omit) }}"
+        api_version: forklift.konveyor.io/v1beta1
+        kind: Provider
+        namespace: "{{ mtv_namespace | default('openshift-mtv') }}"
+      register: _mtv_providers
+      ignore_errors: true
+
+    - name: "check_mtv_status | Get NetworkMaps"
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ k8s_auth_kubeconfig | default(omit) }}"
+        api_token: "{{ k8s_auth_api_token | default(omit) }}"
+        api_version: forklift.konveyor.io/v1beta1
+        kind: NetworkMap
+        namespace: "{{ mtv_namespace | default('openshift-mtv') }}"
+      register: _mtv_networkmaps
+      ignore_errors: true
+
+    - name: "check_mtv_status | Get StorageMaps"
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ k8s_auth_kubeconfig | default(omit) }}"
+        api_token: "{{ k8s_auth_api_token | default(omit) }}"
+        api_version: forklift.konveyor.io/v1beta1
+        kind: StorageMap
+        namespace: "{{ mtv_namespace | default('openshift-mtv') }}"
+      register: _mtv_storagemaps
+      ignore_errors: true
+
+    - name: "check_mtv_status | Reset accumulators"
+      ansible.builtin.set_fact:
+        _mtv_problems: []
+
+    - name: "check_mtv_status | Find mtv-operator CSV"
+      ansible.builtin.set_fact:
+        _mtv_csv: >-
+          {{
+            (_mtv_csvs.resources | default([]))
+            | selectattr('metadata.name', 'match', '^mtv-operator.*')
+            | list | first | default({})
+          }}
+
+    - name: "check_mtv_status | Flag CSV not Succeeded"
+      ansible.builtin.set_fact:
+        _mtv_problems: "{{ _mtv_problems + ['mtv-operator CSV phase=' ~ (_mtv_csv.status.phase | default('NotFound'))] }}"
+      when: (_mtv_csv.status.phase | default('NotFound')) != 'Succeeded'
+
+    - name: "check_mtv_status | Flag Deployments not fully ready"
+      ansible.builtin.set_fact:
+        _mtv_problems: "{{ _mtv_problems + [item.metadata.name ~ ' (desired=' ~ (item.spec.replicas | default(0)) ~ ' ready=' ~ (item.status.readyReplicas | default(0)) ~ ')'] }}"
+      loop: "{{ _mtv_deployments.resources | default([]) }}"
+      loop_control:
+        label: "{{ item.metadata.name }}"
+      when: (item.spec.replicas | default(0) | int) != (item.status.readyReplicas | default(0) | int)
+
+    - name: "check_mtv_status | Flag Providers not Ready"
+      vars:
+        _is_ready: "{{ (item.status.conditions | default([]) | selectattr('type', 'equalto', 'Ready') | selectattr('status', 'equalto', 'True') | list | length) > 0 }}"
+        _critical_conditions: >-
+          {{
+            item.status.conditions | default([])
+            | selectattr('type', 'in', ['ConnectionAuthFailed', 'ConnectionTestFailed', 'SecretNotValid', 'UrlNotValid', 'ProviderTypeNotSupported', 'SettingsNotValid'])
+            | selectattr('status', 'equalto', 'True')
+            | map(attribute='type') | list
+          }}
+      ansible.builtin.set_fact:
+        _mtv_problems: "{{ _mtv_problems + ['Provider ' ~ item.metadata.name ~ ' not Ready' ~ (' (' ~ (_critical_conditions | join(',')) ~ ')' if _critical_conditions | length > 0 else '')] }}"
+      loop: "{{ _mtv_providers.resources | default([]) }}"
+      loop_control:
+        label: "{{ item.metadata.name }}"
+      when: not _is_ready
+
+    - name: "check_mtv_status | Flag NetworkMaps not Ready"
+      vars:
+        _is_ready: "{{ (item.status.conditions | default([]) | selectattr('type', 'equalto', 'Ready') | selectattr('status', 'equalto', 'True') | list | length) > 0 }}"
+      ansible.builtin.set_fact:
+        _mtv_problems: "{{ _mtv_problems + ['NetworkMap ' ~ item.metadata.name ~ ' not Ready'] }}"
+      loop: "{{ _mtv_networkmaps.resources | default([]) }}"
+      loop_control:
+        label: "{{ item.metadata.name }}"
+      when: not _is_ready
+
+    - name: "check_mtv_status | Flag StorageMaps not Ready"
+      vars:
+        _is_ready: "{{ (item.status.conditions | default([]) | selectattr('type', 'equalto', 'Ready') | selectattr('status', 'equalto', 'True') | list | length) > 0 }}"
+      ansible.builtin.set_fact:
+        _mtv_problems: "{{ _mtv_problems + ['StorageMap ' ~ item.metadata.name ~ ' not Ready'] }}"
+      loop: "{{ _mtv_storagemaps.resources | default([]) }}"
+      loop_control:
+        label: "{{ item.metadata.name }}"
+      when: not _is_ready
+
+    - name: "check_mtv_status | Finalize result"
+      ansible.builtin.set_fact:
+        _mtv_status_result:
+          check: check_mtv_status
+          status: >-
+            {{ 'FAIL' if (_mtv_problems | length > 0) else 'PASS' }}
+          message: >-
+            {%- if _mtv_problems | length > 0 -%}
+            {{ _mtv_problems | length }} problem(s) found: {{ _mtv_problems | join('; ') }}
+            {%- else -%}
+            MTV healthy: operator CSV Succeeded, all Deployments ready, {{ _mtv_providers.resources | default([]) | length }} Provider(s) Ready, all Network/StorageMaps Ready
+            {%- endif -%}
+          data:
+            csv_phase: "{{ _mtv_csv.status.phase | default('NotFound') }}"
+            provider_count: "{{ _mtv_providers.resources | default([]) | length }}"
+            problems: "{{ _mtv_problems }}"
+
+    - name: "check_mtv_status | Append result"
+      ansible.builtin.set_fact:
+        healthcheck_results: "{{ healthcheck_results + [_mtv_status_result] }}"
+
+    - name: "check_mtv_status | Show result"
+      ansible.builtin.debug:
+        var: _mtv_status_result

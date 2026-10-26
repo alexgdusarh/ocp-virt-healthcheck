@@ -111,6 +111,8 @@
       tags: [check_hco_config_sanity]
     - role: check_node_vm_readiness
       tags: [check_node_vm_readiness]
+    - role: check_mtv_status
+      tags: [check_mtv_status]
 
   post_tasks:
     - name: Ensure report directory exists
