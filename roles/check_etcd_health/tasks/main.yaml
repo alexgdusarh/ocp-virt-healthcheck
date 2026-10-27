@@ -5,11 +5,13 @@
 # reports Available=True/Degraded=False/Progressing=False.
 #
 # Deliberately pure kubernetes.core.k8s_info, no oc exec - member-level
-# etcdctl detail (DB size, per-member health) stays an oc-script-only
-# capability, same split as check 11's NIC collection. The etcd
-# ClusterOperator's own Degraded condition already reflects member-
-# level problems in its message text (confirmed: e.g. "2 of 3 members
-# are available" surfaces directly there).
+# etcdctl detail (DB size, per-member health, disk/fsync latency via
+# `etcdctl check perf` and the production p99 wal_fsync/backend_commit
+# Prometheus query) stays an oc-script-only capability, same split as
+# check 11's NIC collection - see oc-commands/20_check_etcd_health.sh.
+# The etcd ClusterOperator's own Degraded condition already reflects
+# member-level problems in its message text (confirmed: e.g. "2 of 3
+# members are available" surfaces directly there).
 #
 # Degraded reasons are free text, not a fixed enum (verified) - this
 # role surfaces the actual reason/message rather than matching against
