@@ -32,14 +32,27 @@
     # breaking == 'True'/'true' string comparisons (see memory notes).
     _is_ready: "{{ (item.status.conditions | default([]) | selectattr('type', 'equalto', 'Ready') | selectattr('status', 'equalto', 'True') | list | length) > 0 }}"
     _is_schedulable: "{{ ((item.metadata.labels | default({}))['kubevirt.io/schedulable'] | default('false')) == 'true' }}"
-    _kvm_allocatable: "{{ (item.status.allocatable | default({}))['devices.kubevirt.io/kvm'] | default('0') | int }}"
+    # devices.kubevirt.io/kvm allocatable is a Kubernetes resource.Quantity,
+    # not a bare integer string - it can be serialized with a decimal/binary
+    # SI suffix (e.g. "1k" = 1000), which | int cannot parse (raises
+    # ValueError). Strip and resolve the suffix per the documented
+    # resource.Quantity suffix table before converting.
+    _kvm_raw: "{{ (item.status.allocatable | default({}))['devices.kubevirt.io/kvm'] | default('0') | string }}"
+    _kvm_suffix: "{{ _kvm_raw | regex_replace('^[0-9.]+', '') }}"
+    _kvm_multiplier: >-
+      {{
+        {'': 1, 'n': 0.000000001, 'u': 0.000001, 'm': 0.001,
+         'k': 1000, 'K': 1000, 'M': 1000000, 'G': 1000000000,
+         'Ki': 1024, 'Mi': 1048576, 'Gi': 1073741824}[_kvm_suffix]
+      }}
+    _kvm_allocatable: "{{ (_kvm_raw | regex_replace('[a-zA-Z]+$', '') | float) * (_kvm_multiplier | float) }}"
     _has_drain_taint: "{{ (item.spec.taints | default([]) | selectattr('key', 'equalto', 'kubevirt.io/drain') | list | length) > 0 }}"
     _reasons: >-
       {{
         ([] if _is_ready else ['NotReady'])
         + ([] if not (item.spec.unschedulable | default(false)) else ['cordoned'])
         + ([] if _is_schedulable else ['kubevirt.io/schedulable!=true'])
-        + ([] if (_kvm_allocatable | int) > 0 else ['devices.kubevirt.io/kvm=0'])
+        + ([] if (_kvm_allocatable | float) > 0 else ['devices.kubevirt.io/kvm=0'])
         + ([] if not _has_drain_taint else ['kubevirt.io/drain taint (maintenance in progress)'])
       }}
   ansible.builtin.set_fact:
