@@ -121,6 +121,8 @@
       tags: [check_cnv_rbac_scc]
     - role: check_vlan_trunk_reconciliation
       tags: [check_vlan_trunk_reconciliation]
+    - role: check_cnv_certs
+      tags: [check_cnv_certs]
 
   post_tasks:
     - name: Ensure report directory exists

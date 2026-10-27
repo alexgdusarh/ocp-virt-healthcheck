@@ -1,0 +1,152 @@
+---
+# Check: CNV internal certificates (TLS handshake / trust diagnostics)
+#
+# KubeVirt runs its own self-signed CA (not cert-manager) for internal
+# mTLS between virt-api/virt-controller/virt-handler, in Secrets
+# kubevirt-ca / kubevirt-virt-handler-certs / kubevirt-virt-handler-
+# server-certs / kubevirt-virt-api-certs / kubevirt-controller-certs
+# (namespace openshift-cnv). Server certs default to a 24h lifetime -
+# a stuck rotation becomes a real outage within ~24h.
+#
+# Actual X.509 expiry-date parsing requires openssl and stays an
+# oc-script-only capability (same split as check 20's etcdctl) - this
+# role checks Secret existence, that the virt-handler DaemonSet
+# actually mounts kubevirt-virt-handler-certs (a documented real
+# failure signature: "failed to load the certificate
+# /etc/virt-handler/clientcertificates/..." is a MOUNT defect, not a
+# trust-chain problem), and greps virt-handler pod logs for known
+# TLS/x509 error strings.
+
+- name: "check_cnv_certs | Get CNV cert Secrets"
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ k8s_auth_kubeconfig | default(omit) }}"
+    api_token: "{{ k8s_auth_api_token | default(omit) }}"
+    kind: Secret
+    namespace: "{{ cnv_namespace | default('openshift-cnv') }}"
+  register: _cnv_all_secrets
+  ignore_errors: true
+
+- name: "check_cnv_certs | Get virt-handler DaemonSet"
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ k8s_auth_kubeconfig | default(omit) }}"
+    api_token: "{{ k8s_auth_api_token | default(omit) }}"
+    api_version: apps/v1
+    kind: DaemonSet
+    name: virt-handler
+    namespace: "{{ cnv_namespace | default('openshift-cnv') }}"
+  register: _vh_daemonset
+  ignore_errors: true
+
+- name: "check_cnv_certs | Get virt-handler Pods"
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ k8s_auth_kubeconfig | default(omit) }}"
+    api_token: "{{ k8s_auth_api_token | default(omit) }}"
+    kind: Pod
+    namespace: "{{ cnv_namespace | default('openshift-cnv') }}"
+    label_selectors:
+      - "kubevirt.io=virt-handler"
+  register: _vh_pods
+  ignore_errors: true
+
+- name: "check_cnv_certs | Reset accumulators"
+  ansible.builtin.set_fact:
+    _cert_problems: []
+    _expected_cert_secrets: ['kubevirt-ca', 'kubevirt-virt-handler-certs', 'kubevirt-virt-handler-server-certs', 'kubevirt-virt-api-certs', 'kubevirt-controller-certs']
+    _existing_secret_names: "{{ (_cnv_all_secrets.resources | default([])) | map(attribute='metadata.name') | list }}"
+
+- name: "check_cnv_certs | Flag missing expected cert Secrets"
+  ansible.builtin.set_fact:
+    _cert_problems: "{{ _cert_problems + ['Secret ' ~ item ~ ' not found in ' ~ (cnv_namespace | default('openshift-cnv'))] }}"
+  loop: "{{ _expected_cert_secrets }}"
+  loop_control:
+    label: "{{ item }}"
+  when: >-
+    (item not in _existing_secret_names)
+    and ((_cnv_all_secrets.resources | default([]) | length) > 0)
+
+- name: "check_cnv_certs | Check virt-handler DaemonSet mounts kubevirt-virt-handler-certs"
+  ansible.builtin.set_fact:
+    _vh_mounts_certs: >-
+      {{
+        ((_vh_daemonset.resources | default([]) | first | default({})).spec.template.spec.volumes | default([]))
+        | selectattr('secret.secretName', 'defined')
+        | selectattr('secret.secretName', 'equalto', 'kubevirt-virt-handler-certs')
+        | list | length > 0
+      }}
+
+- name: "check_cnv_certs | Flag virt-handler not mounting its cert Secret"
+  ansible.builtin.set_fact:
+    _cert_problems: "{{ _cert_problems + ['virt-handler DaemonSet does not mount kubevirt-virt-handler-certs - matches the documented \"failed to load the certificate\" mount-defect signature'] }}"
+  when: >-
+    not _vh_mounts_certs
+    and ((_vh_daemonset.resources | default([]) | length) > 0)
+
+- name: "check_cnv_certs | Fetch virt-handler pod logs (tail, for TLS/x509 error grep)"
+  kubernetes.core.k8s_log:
+    kubeconfig: "{{ k8s_auth_kubeconfig | default(omit) }}"
+    api_token: "{{ k8s_auth_api_token | default(omit) }}"
+    namespace: "{{ cnv_namespace | default('openshift-cnv') }}"
+    name: "{{ item.metadata.name }}"
+    tail_lines: 500
+  register: _vh_log_results
+  loop: "{{ _vh_pods.resources | default([]) }}"
+  loop_control:
+    label: "{{ item.metadata.name }}"
+  ignore_errors: true
+
+- name: "check_cnv_certs | Flag virt-handler pods with TLS/x509 error strings in recent logs"
+  vars:
+    _log_text: "{{ item.log | default('') }}"
+  ansible.builtin.set_fact:
+    _cert_problems: "{{ _cert_problems + [(item.item.metadata.name | default('unknown')) ~ ': TLS/x509 error found in logs'] }}"
+  loop: "{{ _vh_log_results.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item.metadata.name | default('unknown') }}"
+  when: >-
+    not (item.failed | default(false))
+    and (_log_text is search('failed to load the certificate|x509:|tls: bad certificate|certificate signed by unknown authority|certificate has expired', ignorecase=True))
+
+- name: "check_cnv_certs | Read cluster-wide Proxy config (heuristic context only, not a confirmed CNV failure mode)"
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ k8s_auth_kubeconfig | default(omit) }}"
+    api_token: "{{ k8s_auth_api_token | default(omit) }}"
+    api_version: config.openshift.io/v1
+    kind: Proxy
+    name: cluster
+  register: _cluster_proxy
+  ignore_errors: true
+
+- name: "check_cnv_certs | Determine if a cluster-wide proxy is configured (informational)"
+  vars:
+    _proxy_spec: "{{ (_cluster_proxy.resources | default([]) | first | default({})).spec | default({}) }}"
+  ansible.builtin.set_fact:
+    _proxy_configured: "{{ (_proxy_spec.httpProxy | default('')) != '' or (_proxy_spec.httpsProxy | default('')) != '' }}"
+    _proxy_no_proxy: "{{ (_cluster_proxy.resources | default([]) | first | default({})).status.noProxy | default('') }}"
+
+- name: "check_cnv_certs | Finalize result"
+  ansible.builtin.set_fact:
+    _cnv_certs_result:
+      check: check_cnv_certs
+      status: >-
+        {{ 'FAIL' if (_cert_problems | length > 0) else 'PASS' }}
+      message: >-
+        {%- if _cert_problems | length > 0 -%}
+        {{ _cert_problems | length }} problem(s) found: {{ _cert_problems | join('; ') }}
+        {%- else -%}
+        all expected CNV cert Secrets present, virt-handler mounts its cert Secret, no TLS/x509 error strings found in recent virt-handler logs
+        {%- endif -%}
+        {{ (' NOTE: cluster-wide proxy IS configured (noProxy=' ~ _proxy_no_proxy ~ ') - if virt-handler TLS errors persist, verify in-cluster traffic (*.pod.cluster.local/*.svc) is actually excluded from proxying (heuristic, not a confirmed documented CNV failure mode).') if _proxy_configured else '' }}
+      data:
+        existing_secrets: "{{ _existing_secret_names }}"
+        virt_handler_mounts_certs: "{{ _vh_mounts_certs }}"
+        proxy_configured: "{{ _proxy_configured }}"
+        proxy_no_proxy: "{{ _proxy_no_proxy }}"
+        problems: "{{ _cert_problems }}"
+
+- name: "check_cnv_certs | Record result"
+  ansible.builtin.set_fact:
+    healthcheck_results: "{{ healthcheck_results + [_cnv_certs_result] }}"
+
+- name: "check_cnv_certs | Show result"
+  ansible.builtin.debug:
+    var: _cnv_certs_result

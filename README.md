@@ -95,6 +95,7 @@ different `KUBECONFIG` — each run produces its own report under `reports/`.
 | 20 | etcd health: ClusterOperator conditions, pod readiness, configured quota | `oc-commands/20_check_etcd_health.sh` | `roles/check_etcd_health` |
 | 21 | RBAC/SCC sanity for CNV service accounts (kubevirt-handler/kubevirt-controller SCCs, ClusterRoleBindings, PSA drift) | `oc-commands/21_check_cnv_rbac_scc.sh` | `roles/check_cnv_rbac_scc` |
 | 22 | VLAN trunk reconciliation for a dedicated bonded uplink carrying many VLANs/NADs (optional - pass `vlan_trunk_bond`) | `oc-commands/22_check_vlan_trunk_reconciliation.sh` | `roles/check_vlan_trunk_reconciliation` |
+| 23 | CNV internal certificates (TLS handshake / trust diagnostics for virt-handler) | `oc-commands/23_check_cnv_certs.sh` | `roles/check_cnv_certs` |
 
 MTV is the component that migrates VMs INTO OpenShift Virtualization
 from external sources (vSphere, oVirt/RHV, OpenStack, OVA) - a separate
@@ -160,6 +161,29 @@ the bond, not by reading a single field. Bond member link-state field
 names are not stable across NMState versions, so this check reports
 raw NodeNetworkState data for manual reading rather than parsing an
 unconfirmed field.
+
+Check 23 targets virt-handler TLS handshake investigations specifically.
+KubeVirt runs its own self-signed CA (not cert-manager) in Secrets under
+`openshift-cnv` (`kubevirt-ca`, `kubevirt-virt-handler-certs`,
+`kubevirt-virt-handler-server-certs`, `kubevirt-virt-api-certs`,
+`kubevirt-controller-certs`); server certs default to a **24h** lifetime
+(CA: 168h), rotating at 80% of lifetime — a stuck rotation becomes a
+real outage within ~24h. Actual expiry-date decoding
+(`openssl x509 -noout -dates`) needs `openssl` and stays an `oc`-script-
+only capability; the Ansible role checks Secret existence, that
+virt-handler's DaemonSet mounts `kubevirt-virt-handler-certs` (a
+documented real failure signature — `"failed to load the certificate
+/etc/virt-handler/clientcertificates/..."` is a **mount defect**, distinct
+from a trust-chain problem), and greps virt-handler logs for TLS/x509
+error strings. The check also surfaces whether a cluster-wide Proxy is
+configured as **context, not a confirmed diagnosis** — a proxy
+inadvertently intercepting virt-handler's in-cluster traffic (via an
+incomplete `noProxy`) is mechanically plausible (a MITM/inspecting
+proxy's re-signed cert wouldn't be in KubeVirt's closed `kubevirt-ca`
+trust bundle) but is **not a documented Red Hat/KubeVirt failure mode**
+— researched explicitly and found no primary source confirming this
+exact chain for CNV, so the check labels it as a heuristic to rule
+in/out, not a cited fact.
 
 Checks 13/14 are mutually exclusive in Ansible: `site.yaml`'s `pre_tasks`
 detect the cluster's actual CNI (CiliumNode CRD presence as the primary
