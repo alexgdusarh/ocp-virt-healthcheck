@@ -16,6 +16,21 @@
 # /etc/virt-handler/clientcertificates/..." is a MOUNT defect, not a
 # trust-chain problem), and greps virt-handler pod logs for known
 # TLS/x509 error strings.
+#
+# IMPORTANT - "failed to load the certificate ... private key does
+# not match public key" is NOT by itself evidence of a broken cert.
+# Verified against real client must-gather data: every KubeVirt
+# component's cert watcher (cert-manager.go) hits this on a steady
+# ~12h cadence (observed clustering around :27/:28 past the hour,
+# twice daily) across virt-handler AND virt-controller, for multiple
+# independent Secrets (server, client, exportca) - a torn read of the
+# projected Secret volume during the watcher's periodic reload, not a
+# persisted bad keypair. It self-clears on the next reload tick with
+# zero correlated TLS handshake failures. Only treat this as a real
+# problem when the SAME error string is still present in the log
+# TAIL (i.e. it did not self-clear and is the most recent relevant
+# line) - that is the signature of a genuinely stuck/corrupted Secret
+# rather than a benign reload race.
 
 - name: "check_cnv_certs | Get CNV cert Secrets"
   kubernetes.core.k8s_info:
@@ -94,17 +109,30 @@
     label: "{{ item.metadata.name }}"
   ignore_errors: true
 
-- name: "check_cnv_certs | Flag virt-handler pods with TLS/x509 error strings in recent logs"
+- name: "check_cnv_certs | Flag virt-handler pods with sustained TLS/x509 trust errors in recent logs"
   vars:
     _log_text: "{{ item.log | default('') }}"
   ansible.builtin.set_fact:
-    _cert_problems: "{{ _cert_problems + [(item.item.metadata.name | default('unknown')) ~ ': TLS/x509 error found in logs'] }}"
+    _cert_problems: "{{ _cert_problems + [(item.item.metadata.name | default('unknown')) ~ ': TLS/x509 trust error found in logs'] }}"
   loop: "{{ _vh_log_results.results | default([]) }}"
   loop_control:
     label: "{{ item.item.metadata.name | default('unknown') }}"
   when: >-
     not (item.failed | default(false))
-    and (_log_text is search('failed to load the certificate|x509:|tls: bad certificate|certificate signed by unknown authority|certificate has expired', ignorecase=True))
+    and (_log_text is search('x509:|tls: bad certificate|tls: handshake failure|certificate signed by unknown authority|certificate has expired|remote error: tls', ignorecase=True))
+
+- name: "check_cnv_certs | Check whether 'private key does not match public key' is still in the log TAIL (not self-cleared)"
+  vars:
+    _log_lines: "{{ (item.log | default('')).split('\n') | reject('equalto', '') | list }}"
+    _last_cert_load_line: "{{ _log_lines | select('search', 'failed to load the certificate') | list | last | default('') }}"
+  ansible.builtin.set_fact:
+    _cert_problems: "{{ _cert_problems + [(item.item.metadata.name | default('unknown')) ~ ': certificate/key mismatch still present in the most recent log lines (not self-cleared by the next reload - possible genuinely stuck Secret, not the benign ~12h reload-race pattern)'] }}"
+  loop: "{{ _vh_log_results.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item.metadata.name | default('unknown') }}"
+  when: >-
+    not (item.failed | default(false))
+    and (_last_cert_load_line is search('does not match public key', ignorecase=True))
 
 - name: "check_cnv_certs | Read cluster-wide Proxy config (heuristic context only, not a confirmed CNV failure mode)"
   kubernetes.core.k8s_info:

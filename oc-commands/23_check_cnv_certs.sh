@@ -19,6 +19,17 @@
 #   - cluster-wide Proxy noProxy coverage (HEURISTIC ONLY - see note
 #     below, this is not a documented CNV failure mode, just a
 #     mechanically plausible precondition worth ruling in/out)
+#
+# NOTE on "failed to load the certificate ... private key does not
+# match public key": verified against real client must-gather data,
+# this fires on a steady ~12h cadence (clustering around :27/:28 past
+# the hour) across virt-handler AND virt-controller, for multiple
+# independent Secrets (server/client/exportca certs) - a torn read of
+# the projected Secret volume during the cert watcher's periodic
+# reload, not a persisted bad keypair. It self-clears on the next
+# reload tick with zero correlated TLS handshake failures observed.
+# Only treat it as a real problem if it is STILL the most recent
+# matching line in the log tail (i.e. never self-cleared).
 set -euo pipefail
 
 NS="${CNV_NAMESPACE:-openshift-cnv}"
@@ -50,9 +61,23 @@ echo
 echo "### virt-handler pods: grep logs for TLS/x509 error signatures ###"
 for POD in $(oc get pods -n "$NS" -l kubevirt.io=virt-handler -o jsonpath='{.items[*].metadata.name}'); do
   echo "--- ${POD} ---"
-  oc logs -n "$NS" "$POD" --tail=500 2>/dev/null \
-    | grep -iE "failed to load the certificate|x509:|tls: bad certificate|certificate signed by unknown authority|certificate has expired" \
-    || echo "(no TLS/x509 error strings found in last 500 lines)"
+  LOG=$(oc logs -n "$NS" "$POD" --tail=500 2>/dev/null)
+  echo "$LOG" | grep -iE "x509:|tls: bad certificate|tls: handshake failure|certificate signed by unknown authority|certificate has expired|remote error: tls" \
+    && echo "^^^ sustained TLS/x509 trust error - investigate" \
+    || echo "(no sustained TLS/x509 trust error strings found in last 500 lines)"
+
+  LAST_CERT_LOAD=$(echo "$LOG" | grep "failed to load the certificate" | tail -1)
+  if [ -n "$LAST_CERT_LOAD" ]; then
+    if echo "$LAST_CERT_LOAD" | grep -q "does not match public key"; then
+      echo "NOTE: most recent cert-load error is still unresolved in the tail:"
+      echo "  $LAST_CERT_LOAD"
+      echo "  -> if this keeps appearing as the LAST such line on repeat checks, it is NOT"
+      echo "     self-clearing and may be a genuinely stuck Secret (not the benign ~12h reload race)."
+    else
+      echo "(most recent cert-load error, if any, is a 'no such file' mount-defect signature - see check notes)"
+      echo "  $LAST_CERT_LOAD"
+    fi
+  fi
 done
 
 echo
