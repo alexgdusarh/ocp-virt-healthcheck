@@ -123,6 +123,8 @@
       tags: [check_vlan_trunk_reconciliation]
     - role: check_cnv_certs
       tags: [check_cnv_certs]
+    - role: check_orphaned_pvcs
+      tags: [check_orphaned_pvcs]
 
   post_tasks:
     - name: Ensure report directory exists

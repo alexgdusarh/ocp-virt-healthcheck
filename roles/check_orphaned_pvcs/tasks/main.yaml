@@ -1,0 +1,126 @@
+---
+# Check: Orphaned PersistentVolumeClaims
+#
+# A PVC not currently mounted by any pod is NOT by itself a reliable
+# orphan signal - CDI-managed VM disk PVCs are legitimately unmounted
+# whenever the owning VM is stopped (confirmed via real must-gather
+# review). The real orphan signal is a PVC whose owner no longer
+# exists:
+#   1. PVC carries CDI/KubeVirt labels
+#      (app.kubernetes.io/managed-by=cdi-controller - confirmed
+#      consistently present on every real CDI-managed PVC reviewed)
+#      but has ZERO ownerReferences.
+#   2. PVC's ownerReference names a DataVolume or VirtualMachine that
+#      does NOT currently exist (owner deleted, but on a
+#      Retain-reclaim-policy StorageClass the PVC/PV was left behind).
+# Deliberately NOT flagging every unowned PVC cluster-wide - verified
+# against real data that plenty of legitimate PVCs (e.g. the internal
+# image registry's own storage) are never owned by anything.
+
+- name: "check_orphaned_pvcs | Get StorageClasses"
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ k8s_auth_kubeconfig | default(omit) }}"
+    api_token: "{{ k8s_auth_api_token | default(omit) }}"
+    api_version: storage.k8s.io/v1
+    kind: StorageClass
+  register: _op_storageclasses
+  ignore_errors: true
+
+- name: "check_orphaned_pvcs | Get PersistentVolumeClaims (all namespaces)"
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ k8s_auth_kubeconfig | default(omit) }}"
+    api_token: "{{ k8s_auth_api_token | default(omit) }}"
+    kind: PersistentVolumeClaim
+  register: _op_pvcs
+  ignore_errors: true
+
+- name: "check_orphaned_pvcs | Get DataVolumes (all namespaces)"
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ k8s_auth_kubeconfig | default(omit) }}"
+    api_token: "{{ k8s_auth_api_token | default(omit) }}"
+    api_version: cdi.kubevirt.io/v1beta1
+    kind: DataVolume
+  register: _op_dvs
+  ignore_errors: true
+
+- name: "check_orphaned_pvcs | Get VirtualMachines (all namespaces)"
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ k8s_auth_kubeconfig | default(omit) }}"
+    api_token: "{{ k8s_auth_api_token | default(omit) }}"
+    api_version: kubevirt.io/v1
+    kind: VirtualMachine
+  register: _op_vms
+  ignore_errors: true
+
+- name: "check_orphaned_pvcs | Reset accumulators"
+  ansible.builtin.set_fact:
+    _orphan_pvc_problems: []
+
+- name: "check_orphaned_pvcs | Build existing DataVolume and VirtualMachine namespace/name refs"
+  ansible.builtin.set_fact:
+    _existing_dv_refs: "{{ (_op_dvs.resources | default([])) | map(attribute='metadata.namespace') | zip((_op_dvs.resources | default([])) | map(attribute='metadata.name')) | map('join', '/') | list }}"
+    _existing_vm_refs: "{{ (_op_vms.resources | default([])) | map(attribute='metadata.namespace') | zip((_op_vms.resources | default([])) | map(attribute='metadata.name')) | map('join', '/') | list }}"
+
+- name: "check_orphaned_pvcs | Flag CDI-managed PVCs with no ownerReference"
+  ansible.builtin.set_fact:
+    _orphan_pvc_problems: "{{ _orphan_pvc_problems + [item.metadata.namespace ~ '/' ~ item.metadata.name ~ ' (CDI-managed, no owner)'] }}"
+  loop: "{{ _op_pvcs.resources | default([]) }}"
+  loop_control:
+    label: "{{ item.metadata.name }}"
+  when: >-
+    ((item.metadata.labels | default({}))['app.kubernetes.io/managed-by'] | default('')) == 'cdi-controller'
+    and (item.metadata.ownerReferences | default([]) | length == 0)
+
+- name: "check_orphaned_pvcs | Flag PVCs whose owning DataVolume no longer exists"
+  vars:
+    _dv_owner: "{{ item.metadata.ownerReferences | default([]) | selectattr('kind', 'equalto', 'DataVolume') | list }}"
+    _owner_ref: "{{ item.metadata.namespace ~ '/' ~ (_dv_owner[0].name | default('')) }}"
+  ansible.builtin.set_fact:
+    _orphan_pvc_problems: "{{ _orphan_pvc_problems + [item.metadata.namespace ~ '/' ~ item.metadata.name ~ ' - owning DataVolume ' ~ _dv_owner[0].name ~ ' NOT FOUND'] }}"
+  loop: "{{ _op_pvcs.resources | default([]) }}"
+  loop_control:
+    label: "{{ item.metadata.name }}"
+  when: >-
+    (_dv_owner | length > 0)
+    and (_owner_ref not in _existing_dv_refs)
+
+- name: "check_orphaned_pvcs | Flag PVCs whose owning VirtualMachine no longer exists"
+  vars:
+    _vm_owner: "{{ item.metadata.ownerReferences | default([]) | selectattr('kind', 'equalto', 'VirtualMachine') | list }}"
+    _owner_ref: "{{ item.metadata.namespace ~ '/' ~ (_vm_owner[0].name | default('')) }}"
+  ansible.builtin.set_fact:
+    _orphan_pvc_problems: "{{ _orphan_pvc_problems + [item.metadata.namespace ~ '/' ~ item.metadata.name ~ ' - owning VirtualMachine ' ~ _vm_owner[0].name ~ ' NOT FOUND'] }}"
+  loop: "{{ _op_pvcs.resources | default([]) }}"
+  loop_control:
+    label: "{{ item.metadata.name }}"
+  when: >-
+    (_vm_owner | length > 0)
+    and (_owner_ref not in _existing_vm_refs)
+
+- name: "check_orphaned_pvcs | Finalize result"
+  vars:
+    _retain_scs: "{{ (_op_storageclasses.resources | default([])) | selectattr('reclaimPolicy', 'equalto', 'Retain') | map(attribute='metadata.name') | list }}"
+  ansible.builtin.set_fact:
+    _orphaned_pvcs_result:
+      check: check_orphaned_pvcs
+      status: >-
+        {{ 'FAIL' if (_orphan_pvc_problems | length > 0) else 'PASS' }}
+      message: >-
+        {%- if _orphan_pvc_problems | length > 0 -%}
+        {{ _orphan_pvc_problems | length }} orphaned PVC(s) found: {{ _orphan_pvc_problems | join('; ') }}
+        {%- else -%}
+        no orphaned PVCs found ({{ _op_pvcs.resources | default([]) | length }} PVC(s) checked)
+        {%- endif -%}
+        {{ (' NOTE: ' ~ (_retain_scs | length) ~ ' StorageClass(es) use Retain reclaim policy (' ~ (_retain_scs | join(',')) ~ ') - PVCs/PVs on these are NOT auto-cleaned when their owner is deleted, so orphans accumulate silently over time.') if _retain_scs | length > 0 else '' }}
+      data:
+        total_pvcs: "{{ _op_pvcs.resources | default([]) | length }}"
+        retain_storageclasses: "{{ _retain_scs }}"
+        problems: "{{ _orphan_pvc_problems }}"
+
+- name: "check_orphaned_pvcs | Record result"
+  ansible.builtin.set_fact:
+    healthcheck_results: "{{ healthcheck_results + [_orphaned_pvcs_result] }}"
+
+- name: "check_orphaned_pvcs | Show result"
+  ansible.builtin.debug:
+    var: _orphaned_pvcs_result

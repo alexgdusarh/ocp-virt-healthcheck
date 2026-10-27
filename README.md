@@ -19,6 +19,13 @@ run unattended across a fleet of clusters.
 - `site.yaml` — runs all checks (or a subset via `--tags`) against one
   cluster, then writes a JSON report and prints a PASS/FAIL/WARN summary.
 - `reports/` — per-cluster JSON reports (git-ignored).
+- `mg/` — client must-gather tarballs and extracted content, plus
+  generated findings files. **Entirely git-ignored — 100% confidential,
+  never committed or pushed.**
+- `scripts/analyze-mustgather.sh` — offline must-gather analysis using
+  [`omc`](https://github.com/gmeghnag/omc) (not an `oc-commands` script —
+  it runs against extracted must-gather data, not a live cluster). See
+  "Must-gather analysis" below.
 
 ## Requirements
 
@@ -68,6 +75,34 @@ ansible-playbook -i inventory/hosts.yaml site.yaml --tags check_clusterversion
 To check another cluster in the fleet, run the same playbook again with a
 different `KUBECONFIG` — each run produces its own report under `reports/`.
 
+## Must-gather analysis
+
+For offline analysis of a collected must-gather (e.g. from check 00),
+using [`omc`](https://github.com/gmeghnag/omc) — an actively-maintained
+community tool (not Red Hat-official) that lets you run `oc`-style
+`get`/`describe`/`logs` commands directly against an extracted
+must-gather, same mental model as the live `oc-commands` scripts.
+
+```bash
+# One-time install (Linux x86_64):
+curl -sL https://github.com/gmeghnag/omc/releases/latest/download/omc_Linux_x86_64.tar.gz \
+  | tar xz -C ~/.local/bin omc && chmod +x ~/.local/bin/omc
+
+# Drop must-gather tarball(s) in mg/ (entirely git-ignored - confidential,
+# never committed/pushed), then:
+./scripts/analyze-mustgather.sh mg/<general-mustgather.tgz> [mg/<virt-mustgather.tgz>]
+```
+
+Prints to the terminal and saves to `mg/findings-<timestamp>.txt` (also
+git-ignored). Archives collected on macOS commonly carry AppleDouble
+`._*` metadata files that `omc` can choke on — the script strips these
+automatically after each extraction. `omc`'s own `use <tarball>` is not
+idempotent against an already-extracted directory (re-extracts noisily,
+and its "current" must-gather selection isn't reliable across repeated
+`use` calls on the same paths) — the script extracts with plain `tar`
+and runs `omc mg delete -a` before each `omc use` to force a clean,
+deterministic selection.
+
 ## Checks implemented
 
 | # | Check | oc script | Role |
@@ -96,6 +131,7 @@ different `KUBECONFIG` — each run produces its own report under `reports/`.
 | 21 | RBAC/SCC sanity for CNV service accounts (kubevirt-handler/kubevirt-controller SCCs, ClusterRoleBindings, PSA drift) | `oc-commands/21_check_cnv_rbac_scc.sh` | `roles/check_cnv_rbac_scc` |
 | 22 | VLAN trunk reconciliation for a dedicated bonded uplink carrying many VLANs/NADs (optional - pass `vlan_trunk_bond`) | `oc-commands/22_check_vlan_trunk_reconciliation.sh` | `roles/check_vlan_trunk_reconciliation` |
 | 23 | CNV internal certificates (TLS handshake / trust diagnostics for virt-handler) | `oc-commands/23_check_cnv_certs.sh` | `roles/check_cnv_certs` |
+| 24 | Orphaned PersistentVolumeClaims (CDI-managed PVC with no owner, or owning DataVolume/VirtualMachine deleted) | `oc-commands/24_check_orphaned_pvcs.sh` | `roles/check_orphaned_pvcs` |
 
 MTV is the component that migrates VMs INTO OpenShift Virtualization
 from external sources (vSphere, oVirt/RHV, OpenStack, OVA) - a separate
@@ -184,6 +220,20 @@ trust bundle) but is **not a documented Red Hat/KubeVirt failure mode**
 — researched explicitly and found no primary source confirming this
 exact chain for CNV, so the check labels it as a heuristic to rule
 in/out, not a cited fact.
+
+Check 24 was added after reviewing a real must-gather: a PVC not
+currently mounted by any pod is **not** by itself a reliable orphan
+signal — CDI-managed VM disk PVCs are legitimately unmounted whenever
+the owning VM is stopped. Real CDI-managed PVCs were confirmed to
+consistently carry the `app.kubernetes.io/managed-by: cdi-controller`
+label, which the check uses to scope its "no owner at all" detection —
+deliberately *not* flagging every unowned PVC cluster-wide, since
+real data showed plenty of legitimate PVCs (e.g. the internal image
+registry's own storage) are never owned by anything. The second,
+sharper signal is a PVC whose `ownerReferences` names a DataVolume or
+VirtualMachine that no longer exists — on a `Retain`-reclaim-policy
+StorageClass (flagged separately when present), that PVC/PV is not
+auto-cleaned when its owner is deleted, so orphans accumulate silently.
 
 Checks 13/14 are mutually exclusive in Ansible: `site.yaml`'s `pre_tasks`
 detect the cluster's actual CNI (CiliumNode CRD presence as the primary
