@@ -76,3 +76,29 @@ oc get pvc -A -o json \
       | ($pvc.metadata.namespace + "/" + $owner_name) as $ref
       | select(($vms | index($ref)) == null)
       | "\($pvc.metadata.namespace)/\($pvc.metadata.name) - owning VirtualMachine \($owner_name) NOT FOUND"'
+
+echo
+echo "### Summary: PVC tally by category ###"
+oc get pvc -A -o json \
+  | jq -r '
+      .items
+      | group_by(
+          if (.metadata.labels["app.kubernetes.io/managed-by"] // "") == "cdi-controller"
+          then "CDI-managed (VM disk)"
+          elif (.metadata.ownerReferences // []) | length == 0
+          then "unowned, non-CDI (e.g. registry/backup storage - normal)"
+          else "owned, non-CDI"
+          end
+        )
+      | map({category: .[0] | (
+          if (.metadata.labels["app.kubernetes.io/managed-by"] // "") == "cdi-controller"
+          then "CDI-managed (VM disk)"
+          elif (.metadata.ownerReferences // []) | length == 0
+          then "unowned, non-CDI (e.g. registry/backup storage - normal)"
+          else "owned, non-CDI"
+          end
+        ), count: length, pvcs: map("\(.metadata.namespace)/\(.metadata.name)")})
+      | .[]
+      | "\(.count)x \(.category): \(.pvcs | join(", "))"'
+echo
+echo "Total PVCs: $(oc get pvc -A -o json | jq -r '.items | length')"

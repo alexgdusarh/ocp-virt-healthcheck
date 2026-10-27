@@ -97,6 +97,20 @@
     (_vm_owner | length > 0)
     and (_owner_ref not in _existing_vm_refs)
 
+- name: "check_orphaned_pvcs | Build per-category PVC tally (documents what was checked, not just problems)"
+  vars:
+    _all_pvcs: "{{ _op_pvcs.resources | default([]) }}"
+    _cdi_pvcs: "{{ _all_pvcs | selectattr('metadata.labels', 'defined') | selectattr('metadata.labels.app.kubernetes.io/managed-by', 'defined') | selectattr('metadata.labels.app.kubernetes.io/managed-by', 'equalto', 'cdi-controller') | list }}"
+    _cdi_names: "{{ _cdi_pvcs | map(attribute='metadata.name') | list }}"
+    _non_cdi_pvcs: "{{ _all_pvcs | rejectattr('metadata.name', 'in', _cdi_names) | list }}"
+    _unowned_non_cdi: "{{ _non_cdi_pvcs | selectattr('metadata.ownerReferences', 'undefined') | list + _non_cdi_pvcs | selectattr('metadata.ownerReferences', 'defined') | selectattr('metadata.ownerReferences', 'equalto', []) | list }}"
+    _owned_non_cdi: "{{ _non_cdi_pvcs | rejectattr('metadata.name', 'in', (_unowned_non_cdi | map(attribute='metadata.name') | list)) | list }}"
+  ansible.builtin.set_fact:
+    _pvc_tally:
+      cdi_managed: "{{ _cdi_pvcs | map(attribute='metadata.namespace') | zip(_cdi_pvcs | map(attribute='metadata.name')) | map('join', '/') | list }}"
+      unowned_non_cdi: "{{ _unowned_non_cdi | map(attribute='metadata.namespace') | zip(_unowned_non_cdi | map(attribute='metadata.name')) | map('join', '/') | list }}"
+      owned_non_cdi: "{{ _owned_non_cdi | map(attribute='metadata.namespace') | zip(_owned_non_cdi | map(attribute='metadata.name')) | map('join', '/') | list }}"
+
 - name: "check_orphaned_pvcs | Finalize result"
   vars:
     _retain_scs: "{{ (_op_storageclasses.resources | default([])) | selectattr('reclaimPolicy', 'equalto', 'Retain') | map(attribute='metadata.name') | list }}"
@@ -109,11 +123,13 @@
         {%- if _orphan_pvc_problems | length > 0 -%}
         {{ _orphan_pvc_problems | length }} orphaned PVC(s) found: {{ _orphan_pvc_problems | join('; ') }}
         {%- else -%}
-        no orphaned PVCs found ({{ _op_pvcs.resources | default([]) | length }} PVC(s) checked)
+        no orphaned PVCs found ({{ _op_pvcs.resources | default([]) | length }} PVC(s) checked:
+        {{ _pvc_tally.cdi_managed | length }}x CDI-managed VM disk, {{ _pvc_tally.unowned_non_cdi | length }}x unowned non-CDI (e.g. registry/backup storage - normal), {{ _pvc_tally.owned_non_cdi | length }}x owned non-CDI)
         {%- endif -%}
         {{ (' NOTE: ' ~ (_retain_scs | length) ~ ' StorageClass(es) use Retain reclaim policy (' ~ (_retain_scs | join(',')) ~ ') - PVCs/PVs on these are NOT auto-cleaned when their owner is deleted, so orphans accumulate silently over time.') if _retain_scs | length > 0 else '' }}
       data:
         total_pvcs: "{{ _op_pvcs.resources | default([]) | length }}"
+        pvc_tally: "{{ _pvc_tally }}"
         retain_storageclasses: "{{ _retain_scs }}"
         problems: "{{ _orphan_pvc_problems }}"
 
