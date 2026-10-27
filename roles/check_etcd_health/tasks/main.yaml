@@ -1,0 +1,99 @@
+---
+# Check: etcd health
+#
+# Foundational cluster health. PASS only if the etcd ClusterOperator
+# reports Available=True/Degraded=False/Progressing=False.
+#
+# Deliberately pure kubernetes.core.k8s_info, no oc exec - member-level
+# etcdctl detail (DB size, per-member health) stays an oc-script-only
+# capability, same split as check 11's NIC collection. The etcd
+# ClusterOperator's own Degraded condition already reflects member-
+# level problems in its message text (confirmed: e.g. "2 of 3 members
+# are available" surfaces directly there).
+#
+# Degraded reasons are free text, not a fixed enum (verified) - this
+# role surfaces the actual reason/message rather than matching against
+# a hard-coded reason list.
+
+- name: "check_etcd_health | Get etcd ClusterOperator"
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ k8s_auth_kubeconfig | default(omit) }}"
+    api_token: "{{ k8s_auth_api_token | default(omit) }}"
+    api_version: config.openshift.io/v1
+    kind: ClusterOperator
+    name: etcd
+  register: _etcd_co
+  ignore_errors: true
+
+- name: "check_etcd_health | Get etcd Pods"
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ k8s_auth_kubeconfig | default(omit) }}"
+    api_token: "{{ k8s_auth_api_token | default(omit) }}"
+    kind: Pod
+    namespace: openshift-etcd
+    label_selectors:
+      - "app=etcd"
+  register: _etcd_pods
+  ignore_errors: true
+
+- name: "check_etcd_health | Reset accumulators"
+  ansible.builtin.set_fact:
+    _etcd_co_problems: []
+    _etcd_pod_problems: []
+
+- name: "check_etcd_health | Evaluate etcd ClusterOperator conditions"
+  vars:
+    _co: "{{ (_etcd_co.resources | default([])) | first | default({}) }}"
+    _conditions: "{{ (_co.status | default({})).conditions | default([]) }}"
+  ansible.builtin.set_fact:
+    _etcd_co_conditions: "{{ _conditions }}"
+
+- name: "check_etcd_health | Flag unhealthy etcd ClusterOperator conditions"
+  ansible.builtin.set_fact:
+    _etcd_co_problems: "{{ _etcd_co_problems + [item.type ~ '=' ~ item.status ~ ' (' ~ (item.reason | default('')) ~ ': ' ~ (item.message | default('')) ~ ')'] }}"
+  loop: "{{ _etcd_co_conditions }}"
+  loop_control:
+    label: "{{ item.type }}"
+  when: >-
+    (item.type == 'Available' and item.status != 'True')
+    or (item.type == 'Degraded' and item.status != 'False')
+    or (item.type == 'Progressing' and item.status != 'False')
+
+- name: "check_etcd_health | Flag etcd pods not Running/Ready"
+  vars:
+    _container_statuses: "{{ item.status.containerStatuses | default([]) }}"
+    _all_ready: "{{ (_container_statuses | map(attribute='ready') | list | unique) == [true] if _container_statuses | length > 0 else false }}"
+  ansible.builtin.set_fact:
+    _etcd_pod_problems: "{{ _etcd_pod_problems + [item.metadata.name ~ ' (phase=' ~ (item.status.phase | default('Unknown')) ~ ')'] }}"
+  loop: "{{ _etcd_pods.resources | default([]) }}"
+  loop_control:
+    label: "{{ item.metadata.name }}"
+  when: (item.status.phase | default('Unknown')) != 'Running' or not _all_ready
+
+- name: "check_etcd_health | Finalize result"
+  vars:
+    _total_problems: "{{ (_etcd_co_problems | length | int) + (_etcd_pod_problems | length | int) }}"
+  ansible.builtin.set_fact:
+    _etcd_health_result:
+      check: check_etcd_health
+      status: >-
+        {{ 'FAIL' if (_total_problems | int > 0) else 'PASS' }}
+      message: >-
+        {%- if _total_problems | int > 0 -%}
+        {{ _total_problems }} problem(s) found
+        {%- if _etcd_co_problems | length > 0 %}; etcd ClusterOperator: {{ _etcd_co_problems | join('; ') }}{% endif %}
+        {%- if _etcd_pod_problems | length > 0 %}; Pods not Running/Ready: {{ _etcd_pod_problems | join('; ') }}{% endif %}
+        {%- else -%}
+        etcd ClusterOperator healthy, all {{ _etcd_pods.resources | default([]) | length }} etcd pod(s) Running/Ready
+        {%- endif -%}
+      data:
+        co_conditions: "{{ _etcd_co_conditions }}"
+        pod_problems: "{{ _etcd_pod_problems }}"
+
+- name: "check_etcd_health | Record result"
+  ansible.builtin.set_fact:
+    healthcheck_results: "{{ healthcheck_results + [_etcd_health_result] }}"
+
+- name: "check_etcd_health | Show result"
+  ansible.builtin.debug:
+    var: _etcd_health_result

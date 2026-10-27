@@ -1,0 +1,165 @@
+---
+# Check: VLAN trunk reconciliation (dedicated bond, many VLANs/NADs)
+#
+# For topologies with one bonded uplink trunking many VLANs (seen:
+# one active-backup bond, 59 VLANs, 59 NADs) - validates at a scale
+# check_vm_networking's basic VLAN cross-check doesn't target.
+#
+# Key fact (researched, verified): NMState has NO trunk-list field at
+# the bond/bridge level. The "trunk" is whatever set of NNCP-managed
+# type:vlan sub-interfaces (vlan.base-iface == <bond>, vlan.id == N)
+# actually exist - that set IS the trunk, built by enumeration here,
+# not looked up from a single field.
+#
+# Requires `vlan_trunk_bond` to be set (-e vlan_trunk_bond=bond0) -
+# there is no reliable way to auto-detect "the" dedicated VM-traffic
+# bond generically across different fleet topologies, so this check
+# is skipped (not failed) when the var isn't provided.
+#
+# Bond member link-state field names are NOT stable across NMState
+# versions (researched, medium confidence only) - this check does not
+# parse/assert a specific field name for member status; it only
+# reports whether NodeNetworkState data exists for the bond per node,
+# leaving human reading of the raw link-aggregation status to the
+# oc-script companion.
+
+- name: "check_vlan_trunk_reconciliation | Skip if vlan_trunk_bond not provided"
+  ansible.builtin.set_fact:
+    _vlan_trunk_result:
+      check: check_vlan_trunk_reconciliation
+      status: PASS
+      message: "Skipped: vlan_trunk_bond not set (pass -e vlan_trunk_bond=<bond-name> to enable this check)"
+      data: {}
+  when: vlan_trunk_bond is not defined
+
+- name: "check_vlan_trunk_reconciliation | Record skip result"
+  ansible.builtin.set_fact:
+    healthcheck_results: "{{ healthcheck_results + [_vlan_trunk_result] }}"
+  when: vlan_trunk_bond is not defined
+
+- name: "check_vlan_trunk_reconciliation | Run real checks"
+  when: vlan_trunk_bond is defined
+  block:
+    - name: "check_vlan_trunk_reconciliation | Get NetworkAttachmentDefinitions (all namespaces)"
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ k8s_auth_kubeconfig | default(omit) }}"
+        api_token: "{{ k8s_auth_api_token | default(omit) }}"
+        api_version: k8s.cni.cncf.io/v1
+        kind: NetworkAttachmentDefinition
+      register: _vt_nads
+      ignore_errors: true
+
+    - name: "check_vlan_trunk_reconciliation | Get NodeNetworkConfigurationPolicies"
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ k8s_auth_kubeconfig | default(omit) }}"
+        api_token: "{{ k8s_auth_api_token | default(omit) }}"
+        api_version: nmstate.io/v1
+        kind: NodeNetworkConfigurationPolicy
+      register: _vt_nncp
+      ignore_errors: true
+
+    - name: "check_vlan_trunk_reconciliation | Get NodeNetworkStates"
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ k8s_auth_kubeconfig | default(omit) }}"
+        api_token: "{{ k8s_auth_api_token | default(omit) }}"
+        api_version: nmstate.io/v1beta1
+        kind: NodeNetworkState
+      register: _vt_nns
+      ignore_errors: true
+
+    - name: "check_vlan_trunk_reconciliation | Reset accumulators"
+      ansible.builtin.set_fact:
+        _vt_nad_vlans_raw: []
+        _vt_duplicate_vlans: []
+        _vt_nns_missing_bond: []
+
+    - name: "check_vlan_trunk_reconciliation | Extract each NAD's VLAN ID (from its JSON-embedded config)"
+      vars:
+        _config: "{{ item.spec.config | default('{}') | from_json }}"
+      ansible.builtin.set_fact:
+        _vt_nad_vlans_raw: "{{ _vt_nad_vlans_raw + ([{'ref': item.metadata.namespace ~ '/' ~ item.metadata.name, 'vlan': _config.vlan}] if _config.vlan is defined else []) }}"
+      loop: "{{ _vt_nads.resources | default([]) }}"
+      loop_control:
+        label: "{{ item.metadata.name }}"
+      ignore_errors: true
+
+    - name: "check_vlan_trunk_reconciliation | Flag duplicate VLAN IDs across NADs"
+      vars:
+        _refs_for_vlan: "{{ _vt_nad_vlans_raw | selectattr('vlan', 'equalto', item) | map(attribute='ref') | list }}"
+      ansible.builtin.set_fact:
+        _vt_duplicate_vlans: "{{ _vt_duplicate_vlans + ['VLAN ' ~ item ~ ' used by: ' ~ (_refs_for_vlan | join(', '))] }}"
+      loop: "{{ _vt_nad_vlans_raw | map(attribute='vlan') | unique | list }}"
+      loop_control:
+        label: "{{ item }}"
+      when: (_refs_for_vlan | length) > 1
+
+    - name: "check_vlan_trunk_reconciliation | Enumerate VLANs actually trunked on the target bond (NNCP vlan sub-interfaces)"
+      ansible.builtin.set_fact:
+        _vt_trunk_vlans: >-
+          {{
+            (_vt_nncp.resources | default([]))
+            | subelements('spec.desiredState.interfaces', skip_missing=True)
+            | selectattr('1.type', 'equalto', 'vlan')
+            | selectattr('1.vlan', 'defined')
+            | selectattr('1.vlan.base-iface', 'defined')
+            | selectattr('1.vlan.base-iface', 'equalto', vlan_trunk_bond)
+            | map(attribute='1.vlan.id')
+            | unique | list
+          }}
+
+    - name: "check_vlan_trunk_reconciliation | Collect NAD-referenced VLANs (unique)"
+      ansible.builtin.set_fact:
+        _vt_nad_vlans: "{{ _vt_nad_vlans_raw | map(attribute='vlan') | unique | list }}"
+
+    - name: "check_vlan_trunk_reconciliation | Determine two-way reconciliation gaps"
+      ansible.builtin.set_fact:
+        _vt_trunked_no_nad: "{{ _vt_trunk_vlans | difference(_vt_nad_vlans) }}"
+        _vt_nad_not_trunked: "{{ _vt_nad_vlans | difference(_vt_trunk_vlans) }}"
+
+    - name: "check_vlan_trunk_reconciliation | Flag nodes with no NodeNetworkState data for the target bond"
+      vars:
+        _bond_entry: "{{ item.status.currentState.interfaces | default([]) | selectattr('name', 'equalto', vlan_trunk_bond) | list }}"
+      ansible.builtin.set_fact:
+        _vt_nns_missing_bond: "{{ _vt_nns_missing_bond + [item.metadata.name] }}"
+      loop: "{{ _vt_nns.resources | default([]) }}"
+      loop_control:
+        label: "{{ item.metadata.name }}"
+      when: _bond_entry | length == 0
+
+    - name: "check_vlan_trunk_reconciliation | Finalize result"
+      vars:
+        _total_problems: >-
+          {{
+            (_vt_duplicate_vlans | length | int) + (_vt_nad_not_trunked | length | int)
+            + (_vt_nns_missing_bond | length | int)
+          }}
+      ansible.builtin.set_fact:
+        _vlan_trunk_result:
+          check: check_vlan_trunk_reconciliation
+          status: >-
+            {{ 'FAIL' if (_total_problems | int > 0) else 'PASS' }}
+          message: >-
+            {%- if _total_problems | int > 0 -%}
+            {{ _total_problems }} problem(s) found on bond {{ vlan_trunk_bond }}
+            {%- if _vt_duplicate_vlans | length > 0 %}; duplicate NAD VLANs: {{ _vt_duplicate_vlans | join('; ') }}{% endif %}
+            {%- if _vt_nad_not_trunked | length > 0 %}; NAD VLANs NOT trunked (traffic will not pass): {{ _vt_nad_not_trunked | join(',') }}{% endif %}
+            {%- if _vt_nns_missing_bond | length > 0 %}; nodes with no NodeNetworkState for {{ vlan_trunk_bond }}: {{ _vt_nns_missing_bond | join(',') }}{% endif %}
+            {%- else -%}
+            bond {{ vlan_trunk_bond }}: {{ _vt_trunk_vlans | length }} VLAN(s) trunked, {{ _vt_nad_vlans | length }} NAD VLAN(s), fully reconciled, no duplicates
+            {%- endif -%}
+          data:
+            bond: "{{ vlan_trunk_bond }}"
+            trunked_vlan_count: "{{ _vt_trunk_vlans | length }}"
+            nad_vlan_count: "{{ _vt_nad_vlans | length }}"
+            duplicate_vlans: "{{ _vt_duplicate_vlans }}"
+            trunked_not_referenced_by_nad: "{{ _vt_trunked_no_nad }}"
+            nad_not_trunked: "{{ _vt_nad_not_trunked }}"
+            nodes_missing_nns_for_bond: "{{ _vt_nns_missing_bond }}"
+
+    - name: "check_vlan_trunk_reconciliation | Record result"
+      ansible.builtin.set_fact:
+        healthcheck_results: "{{ healthcheck_results + [_vlan_trunk_result] }}"
+
+    - name: "check_vlan_trunk_reconciliation | Show result"
+      ansible.builtin.debug:
+        var: _vlan_trunk_result

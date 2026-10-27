@@ -1,0 +1,171 @@
+---
+# Check: RBAC/SCC sanity for OpenShift Virtualization service accounts
+#
+# A well-meaning but overly-restrictive security policy stripping an
+# SCC binding or RoleBinding is a well-documented "VMs silently can't
+# start" root cause (real instance: CNV-20531/RHBZ 2119128 - virt-
+# launcher pods rejected once openshift-cnv's effective PSA enforce
+# level tightened after an SCC/RBAC change). The PSA enforce label is
+# computed by OCP's own label-sync controller from the most-privileged
+# SCC each namespace's service accounts are bound to - it is not
+# something anyone edits directly, so a drifted label is itself a
+# symptom of an upstream SCC/RBAC change, not the root cause.
+#
+# Deliberately reads LIVE state rather than asserting fixed expected
+# SCC field values (e.g. allowedCapabilities), since those are
+# version-dependent and not reliably documented across OCP releases
+# (researched and confirmed inconsistent across sources). Flags
+# genuine absence/drift: missing SCCs, CNV service accounts with no
+# matching ClusterRoleBinding, and any virt-launcher pod stuck Pending
+# with a security-context-related admission error.
+
+- name: "check_cnv_rbac_scc | Get kubevirt-handler SCC"
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ k8s_auth_kubeconfig | default(omit) }}"
+    api_token: "{{ k8s_auth_api_token | default(omit) }}"
+    api_version: security.openshift.io/v1
+    kind: SecurityContextConstraints
+    name: kubevirt-handler
+  register: _scc_handler
+  ignore_errors: true
+
+- name: "check_cnv_rbac_scc | Get kubevirt-controller SCC"
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ k8s_auth_kubeconfig | default(omit) }}"
+    api_token: "{{ k8s_auth_api_token | default(omit) }}"
+    api_version: security.openshift.io/v1
+    kind: SecurityContextConstraints
+    name: kubevirt-controller
+  register: _scc_controller
+  ignore_errors: true
+
+- name: "check_cnv_rbac_scc | Get ClusterRoleBindings"
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ k8s_auth_kubeconfig | default(omit) }}"
+    api_token: "{{ k8s_auth_api_token | default(omit) }}"
+    api_version: rbac.authorization.k8s.io/v1
+    kind: ClusterRoleBinding
+  register: _cnv_crbs
+  ignore_errors: true
+
+- name: "check_cnv_rbac_scc | Get openshift-cnv Namespace (for PSA labels)"
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ k8s_auth_kubeconfig | default(omit) }}"
+    api_token: "{{ k8s_auth_api_token | default(omit) }}"
+    kind: Namespace
+    name: "{{ cnv_namespace | default('openshift-cnv') }}"
+  register: _cnv_ns
+  ignore_errors: true
+
+- name: "check_cnv_rbac_scc | Get Pending virt-launcher Pods"
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ k8s_auth_kubeconfig | default(omit) }}"
+    api_token: "{{ k8s_auth_api_token | default(omit) }}"
+    kind: Pod
+    label_selectors:
+      - "kubevirt.io=virt-launcher"
+  register: _virt_launcher_pods
+  ignore_errors: true
+
+- name: "check_cnv_rbac_scc | Reset accumulators"
+  ansible.builtin.set_fact:
+    _rbac_scc_problems: []
+    _cnv_crb_subjects: []
+
+- name: "check_cnv_rbac_scc | Flag missing kubevirt-handler SCC"
+  ansible.builtin.set_fact:
+    _rbac_scc_problems: "{{ _rbac_scc_problems + ['SCC kubevirt-handler not found'] }}"
+  when: (_scc_handler.resources | default([]) | length) == 0
+
+- name: "check_cnv_rbac_scc | Flag missing kubevirt-controller SCC"
+  ansible.builtin.set_fact:
+    _rbac_scc_problems: "{{ _rbac_scc_problems + ['SCC kubevirt-controller not found'] }}"
+  when: (_scc_controller.resources | default([]) | length) == 0
+
+- name: "check_cnv_rbac_scc | Flag kubevirt-handler SCC with no bound users"
+  ansible.builtin.set_fact:
+    _rbac_scc_problems: "{{ _rbac_scc_problems + ['SCC kubevirt-handler has no users bound'] }}"
+  when: >-
+    (_scc_handler.resources | default([]) | length) > 0
+    and (((_scc_handler.resources | first).users | default([])) | length) == 0
+
+- name: "check_cnv_rbac_scc | Flag kubevirt-controller SCC with no bound users"
+  ansible.builtin.set_fact:
+    _rbac_scc_problems: "{{ _rbac_scc_problems + ['SCC kubevirt-controller has no users bound'] }}"
+  when: >-
+    (_scc_controller.resources | default([]) | length) > 0
+    and (((_scc_controller.resources | first).users | default([])) | length) == 0
+
+- name: "check_cnv_rbac_scc | Collect CNV-relevant ClusterRoleBinding subject names"
+  ansible.builtin.set_fact:
+    _cnv_crb_subjects: >-
+      {{
+        _cnv_crb_subjects + (
+          item.subjects | default([])
+          | selectattr('namespace', 'defined')
+          | selectattr('namespace', 'equalto', cnv_namespace | default('openshift-cnv'))
+          | map(attribute='name') | list
+        )
+      }}
+  loop: "{{ _cnv_crbs.resources | default([]) }}"
+  loop_control:
+    label: "{{ item.metadata.name }}"
+
+- name: "check_cnv_rbac_scc | Flag expected CNV service accounts with no ClusterRoleBinding"
+  vars:
+    _expected_sas: ['hco-operator', 'cdi-operator', 'virt-operator', 'virt-api', 'virt-controller', 'virt-handler']
+  ansible.builtin.set_fact:
+    _rbac_scc_problems: "{{ _rbac_scc_problems + [item ~ ' service account has no ClusterRoleBinding in ' ~ (cnv_namespace | default('openshift-cnv'))] }}"
+  loop: "{{ _expected_sas }}"
+  loop_control:
+    label: "{{ item }}"
+  when: >-
+    (item not in _cnv_crb_subjects)
+    and ((_cnv_crbs.resources | default([]) | length) > 0)
+
+- name: "check_cnv_rbac_scc | Flag Pending virt-launcher pods with security-context related reasons"
+  vars:
+    _conditions_text: "{{ (item.status.conditions | default([])) | map(attribute='message') | default([]) | join(' ') }}"
+  ansible.builtin.set_fact:
+    _rbac_scc_problems: "{{ _rbac_scc_problems + [item.metadata.namespace ~ '/' ~ item.metadata.name ~ ' Pending: ' ~ _conditions_text] }}"
+  loop: "{{ _virt_launcher_pods.resources | default([]) }}"
+  loop_control:
+    label: "{{ item.metadata.name }}"
+  when: >-
+    (item.status.phase | default('') == 'Pending')
+    and (_conditions_text is search('securityContext|forbidden|violat|SecurityContextConstraint', ignorecase=True))
+
+- name: "check_cnv_rbac_scc | Read current PSA labels (informational, not asserted)"
+  ansible.builtin.set_fact:
+    _psa_labels: >-
+      {{
+        (_cnv_ns.resources | default([]) | first | default({})).metadata.labels | default({})
+        | dict2items
+        | selectattr('key', 'match', '^pod-security.kubernetes.io/.*')
+        | items2dict
+      }}
+
+- name: "check_cnv_rbac_scc | Finalize result"
+  ansible.builtin.set_fact:
+    _cnv_rbac_scc_result:
+      check: check_cnv_rbac_scc
+      status: >-
+        {{ 'FAIL' if (_rbac_scc_problems | length > 0) else 'PASS' }}
+      message: >-
+        {%- if _rbac_scc_problems | length > 0 -%}
+        {{ _rbac_scc_problems | length }} problem(s) found: {{ _rbac_scc_problems | join('; ') }}
+        {%- else -%}
+        kubevirt-handler and kubevirt-controller SCCs present with bound users, expected CNV service accounts have ClusterRoleBindings, no Pending virt-launcher pods with security-context errors (current PSA labels: {{ _psa_labels }})
+        {%- endif -%}
+      data:
+        psa_labels: "{{ _psa_labels }}"
+        cnv_crb_subjects: "{{ _cnv_crb_subjects | unique | list }}"
+        problems: "{{ _rbac_scc_problems }}"
+
+- name: "check_cnv_rbac_scc | Record result"
+  ansible.builtin.set_fact:
+    healthcheck_results: "{{ healthcheck_results + [_cnv_rbac_scc_result] }}"
+
+- name: "check_cnv_rbac_scc | Show result"
+  ansible.builtin.debug:
+    var: _cnv_rbac_scc_result

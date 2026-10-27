@@ -92,6 +92,9 @@ different `KUBECONFIG` — each run produces its own report under `reports/`.
 | 17 | Node readiness for VM scheduling (pre-workload): Ready, cordon, kubevirt.io/schedulable, KVM device, drain taint | `oc-commands/17_check_node_vm_readiness.sh` | `roles/check_node_vm_readiness` |
 | 18 | MTV (Migration Toolkit for Virtualization / Forklift) operator health (optional - PASS if not installed) | `oc-commands/18_check_mtv_status.sh` | `roles/check_mtv_status` |
 | 19 | Capacity inventory (pre-workload, informational): CPU/memory/hugepages Capacity vs. Allocatable, per node and summed cluster-wide + for the kubevirt.io/schedulable pool | `oc-commands/19_check_capacity_inventory.sh` | `roles/check_capacity_inventory` |
+| 20 | etcd health: ClusterOperator conditions, pod readiness, configured quota | `oc-commands/20_check_etcd_health.sh` | `roles/check_etcd_health` |
+| 21 | RBAC/SCC sanity for CNV service accounts (kubevirt-handler/kubevirt-controller SCCs, ClusterRoleBindings, PSA drift) | `oc-commands/21_check_cnv_rbac_scc.sh` | `roles/check_cnv_rbac_scc` |
+| 22 | VLAN trunk reconciliation for a dedicated bonded uplink carrying many VLANs/NADs (optional - pass `vlan_trunk_bond`) | `oc-commands/22_check_vlan_trunk_reconciliation.sh` | `roles/check_vlan_trunk_reconciliation` |
 
 MTV is the component that migrates VMs INTO OpenShift Virtualization
 from external sources (vSphere, oVirt/RHV, OpenStack, OVA) - a separate
@@ -126,6 +129,37 @@ differ (e.g. HCO defaults `completionTimeoutPerGiB` to 20, not upstream's
 corroborated by an actual `devices.kubevirt.io/kvm` allocatable count,
 since the two can diverge (documented upstream gap,
 [kubevirt/kubevirt#8583](https://github.com/kubevirt/kubevirt/issues/8583)).
+
+Check 21 reads live SCC/RBAC/PSA state rather than asserting fixed
+expected values (e.g. specific `allowedCapabilities`), since those are
+version-dependent and not reliably documented across OCP releases. The
+Pod Security Admission enforce label on `openshift-cnv` is computed by
+OCP's own label-sync controller from the SCCs each namespace's service
+accounts are bound to — it is not something anyone edits directly, so a
+drifted PSA label is a symptom of an upstream SCC/RBAC change, not the
+thing to fix in isolation.
+
+Check 22 is for topologies with one dedicated bonded uplink (e.g.
+active-backup) trunking many VLANs, each exposed via its own NAD — the
+scale check 11's basic VLAN cross-check doesn't target (seen in practice:
+one bond, 59 VLANs, 59 NADs). It requires `vlan_trunk_bond` to be set
+(there's no reliable way to auto-detect "the" dedicated VM-traffic bond
+generically) and is skipped (PASS, not FAIL) otherwise:
+
+```bash
+ansible-playbook -i inventory/hosts.yaml site.yaml \
+  --tags check_vlan_trunk_reconciliation -e vlan_trunk_bond=bond0
+
+BOND_NAME=bond0 ./oc-commands/22_check_vlan_trunk_reconciliation.sh
+```
+
+NMState has **no trunk-list field** at the bond/bridge level (verified
+from upstream source) — "is VLAN X trunked" is answered by enumerating
+NNCP-managed `type: vlan` sub-interfaces whose `vlan.base-iface` matches
+the bond, not by reading a single field. Bond member link-state field
+names are not stable across NMState versions, so this check reports
+raw NodeNetworkState data for manual reading rather than parsing an
+unconfirmed field.
 
 Checks 13/14 are mutually exclusive in Ansible: `site.yaml`'s `pre_tasks`
 detect the cluster's actual CNI (CiliumNode CRD presence as the primary
