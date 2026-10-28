@@ -25,12 +25,22 @@
 # twice daily) across virt-handler AND virt-controller, for multiple
 # independent Secrets (server, client, exportca) - a torn read of the
 # projected Secret volume during the watcher's periodic reload, not a
-# persisted bad keypair. It self-clears on the next reload tick with
-# zero correlated TLS handshake failures. Only treat this as a real
-# problem when the SAME error string is still present in the log
-# TAIL (i.e. it did not self-clear and is the most recent relevant
-# line) - that is the signature of a genuinely stuck/corrupted Secret
-# rather than a benign reload race.
+# persisted bad keypair.
+#
+# CORRECTED (real-world RCA from the client engagement, confirmed
+# directly against the live cluster): checking whether the error is
+# still the LAST matching line in the log tail is NOT a reliable
+# self-clear signal, and produced a false CRITICAL in a real run.
+# virt-handler does not log a positive "cert reloaded OK" confirmation
+# on success, so a benign occurrence that recovered within the same
+# second looks IDENTICAL in the log tail to one that never recovered.
+# The client's RCA used the actual correct signal: pod restart count
+# and current Running/Ready state. Zero restarts correlated with the
+# error timestamps, and the pod stayed Running/Ready throughout -
+# meaning TLS availability was never actually interrupted, because
+# rotation completes well before the old cert expires. This role now
+# checks THAT signal (restartCount + Running/Ready), not log-tail
+# position.
 
 - name: "check_cnv_certs | Get CNV cert Secrets"
   kubernetes.core.k8s_info:
@@ -121,18 +131,54 @@
     not (item.failed | default(false))
     and (_log_text is search('x509:|tls: bad certificate|tls: handshake failure|certificate signed by unknown authority|certificate has expired|remote error: tls', ignorecase=True))
 
-- name: "check_cnv_certs | Check whether 'private key does not match public key' is still in the log TAIL (not self-cleared)"
-  vars:
-    _log_lines: "{{ (item.log | default('')).split('\n') | reject('equalto', '') | list }}"
-    _last_cert_load_line: "{{ _log_lines | select('search', 'failed to load the certificate') | list | last | default('') }}"
+- name: "check_cnv_certs | Reset cert-mismatch accumulators"
   ansible.builtin.set_fact:
-    _cert_problems: "{{ _cert_problems + [(item.item.metadata.name | default('unknown')) ~ ': certificate/key mismatch still present in the most recent log lines (not self-cleared by the next reload - possible genuinely stuck Secret, not the benign ~12h reload-race pattern)'] }}"
+    _cert_benign_notes: []
+
+- name: "check_cnv_certs | Flag pods with a cert/key mismatch NOT cleanly Running/Ready with zero restarts (CRITICAL)"
+  # Correlation signal, not tail-position: a mismatch occurrence is
+  # benign when the pod is currently Running/Ready with zero container
+  # restarts (matches the client RCA: the pod never actually lost TLS
+  # availability). A pod that DID restart, or is not currently
+  # Running/Ready, needs the restart's finishedAt timestamp manually
+  # correlated against the mismatch occurrences before ruling it
+  # benign - flag it rather than silently assume either way.
+  vars:
+    _log_text: "{{ item.log | default('') }}"
+    _mismatch_count: "{{ _log_text | regex_findall('does not match public key') | length }}"
+    _pod_resource: "{{ (_vh_pods.resources | default([])) | selectattr('metadata.name', 'equalto', item.item.metadata.name) | first | default({}) }}"
+    _container_status: "{{ (_pod_resource.status.containerStatuses | default([])) | selectattr('name', 'equalto', 'virt-handler') | first | default({}) }}"
+    _restart_count: "{{ _container_status.restartCount | default(-1) }}"
+    _is_ready: "{{ _container_status.ready | default(false) }}"
+    _phase: "{{ _pod_resource.status.phase | default('Unknown') }}"
+  ansible.builtin.set_fact:
+    _cert_problems: "{{ _cert_problems + [(item.item.metadata.name | default('unknown')) ~ ': ' ~ (_mismatch_count | string) ~ ' certificate/key mismatch occurrence(s) in recent logs, but pod is NOT cleanly Running/Ready with zero restarts (phase=' ~ _phase ~ ', ready=' ~ (_is_ready | string) ~ ', restartCount=' ~ (_restart_count | string) ~ ') - correlate restart timestamp against mismatch occurrences before ruling benign'] }}"
   loop: "{{ _vh_log_results.results | default([]) }}"
   loop_control:
     label: "{{ item.item.metadata.name | default('unknown') }}"
   when: >-
     not (item.failed | default(false))
-    and (_last_cert_load_line is search('does not match public key', ignorecase=True))
+    and (_mismatch_count | int > 0)
+    and not (_phase == 'Running' and _is_ready and (_restart_count | int) == 0)
+
+- name: "check_cnv_certs | Note benign cert/key mismatch occurrences (pod Running/Ready, zero restarts - INFO only)"
+  vars:
+    _log_text: "{{ item.log | default('') }}"
+    _mismatch_count: "{{ _log_text | regex_findall('does not match public key') | length }}"
+    _pod_resource: "{{ (_vh_pods.resources | default([])) | selectattr('metadata.name', 'equalto', item.item.metadata.name) | first | default({}) }}"
+    _container_status: "{{ (_pod_resource.status.containerStatuses | default([])) | selectattr('name', 'equalto', 'virt-handler') | first | default({}) }}"
+    _restart_count: "{{ _container_status.restartCount | default(-1) }}"
+    _is_ready: "{{ _container_status.ready | default(false) }}"
+    _phase: "{{ _pod_resource.status.phase | default('Unknown') }}"
+  ansible.builtin.set_fact:
+    _cert_benign_notes: "{{ _cert_benign_notes + [(item.item.metadata.name | default('unknown')) ~ ': ' ~ (_mismatch_count | string) ~ ' benign cert-reload-race occurrence(s) (pod Running/Ready, zero restarts - TLS availability never interrupted)'] }}"
+  loop: "{{ _vh_log_results.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item.metadata.name | default('unknown') }}"
+  when: >-
+    not (item.failed | default(false))
+    and (_mismatch_count | int > 0)
+    and (_phase == 'Running' and _is_ready and (_restart_count | int) == 0)
 
 - name: "check_cnv_certs | Read cluster-wide Proxy config (heuristic context only, not a confirmed CNV failure mode)"
   kubernetes.core.k8s_info:
@@ -163,6 +209,7 @@
         {%- else -%}
         all expected CNV cert Secrets present, virt-handler mounts its cert Secret, no TLS/x509 error strings found in recent virt-handler logs
         {%- endif -%}
+        {{ (' Benign cert-reload-race occurrences noted (Running/Ready, zero restarts, TLS never interrupted): ' ~ (_cert_benign_notes | join('; ')) ~ '.') if (_cert_benign_notes | default([]) | length > 0) else '' }}
         {{ (' NOTE: cluster-wide proxy IS configured (noProxy=' ~ _proxy_no_proxy ~ ') - if virt-handler TLS errors persist, verify in-cluster traffic (*.pod.cluster.local/*.svc) is actually excluded from proxying (heuristic, not a confirmed documented CNV failure mode).') if _proxy_configured else '' }}
       data:
         existing_secrets: "{{ _existing_secret_names }}"
@@ -170,6 +217,7 @@
         proxy_configured: "{{ _proxy_configured }}"
         proxy_no_proxy: "{{ _proxy_no_proxy }}"
         problems: "{{ _cert_problems }}"
+        benign_cert_reload_occurrences: "{{ _cert_benign_notes | default([]) }}"
 
 - name: "check_cnv_certs | Record result"
   ansible.builtin.set_fact:
