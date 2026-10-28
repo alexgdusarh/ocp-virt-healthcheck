@@ -37,6 +37,7 @@
 - name: "check_hco_config_sanity | Reset accumulators"
   ansible.builtin.set_fact:
     _hco_cfg_problems: []
+    _hco_cfg_warnings: []
 
 - name: "check_hco_config_sanity | Extract relevant spec fields"
   vars:
@@ -89,9 +90,15 @@
         | unique | list
       }}
 
-- name: "check_hco_config_sanity | Flag unset defaultCPUModel with heterogeneous node CPUs"
+- name: "check_hco_config_sanity | Flag unset defaultCPUModel with heterogeneous node CPUs (WARNING, not CRITICAL)"
+  # NOTE: heterogeneous node CPU models are a real risk (VMs without an
+  # explicit CPU model get migration-constrained to a CPU-compatible
+  # subset of nodes) but the cluster is not currently broken because of
+  # it - live migration still works, it is just limited in scope. This
+  # is a risk to flag for review, not a genuine misconfiguration like
+  # the migration-disabling settings above.
   ansible.builtin.set_fact:
-    _hco_cfg_problems: "{{ _hco_cfg_problems + ['defaultCPUModel unset (effective default: host-model) with ' ~ (_node_cpu_models | length) ~ ' distinct node CPU models (' ~ (_node_cpu_models | join(',')) ~ '): VMs without an explicit CPU model will be migration-constrained to a subset of nodes'] }}"
+    _hco_cfg_warnings: "{{ _hco_cfg_warnings + ['defaultCPUModel unset (effective default: host-model) with ' ~ (_node_cpu_models | length) ~ ' distinct node CPU models (' ~ (_node_cpu_models | join(',')) ~ '): VMs without an explicit CPU model will be migration-constrained to a subset of nodes'] }}"
   when: (_default_cpu_model == '') and (_node_cpu_models | length > 1)
 
 - name: "check_hco_config_sanity | Finalize result"
@@ -99,10 +106,17 @@
     _hco_config_sanity_result:
       check: check_hco_config_sanity
       status: >-
-        {{ 'CRITICAL' if (_hco_cfg_problems | length > 0) else 'OK' }}
+        {{
+          'CRITICAL' if (_hco_cfg_problems | length > 0) else
+          'WARNING' if (_hco_cfg_warnings | length > 0) else
+          'OK'
+        }}
       message: >-
         {%- if _hco_cfg_problems | length > 0 -%}
         {{ _hco_cfg_problems | length }} config issue(s) found: {{ _hco_cfg_problems | join('; ') }}
+        {%- if _hco_cfg_warnings | length > 0 %}; also: {{ _hco_cfg_warnings | join('; ') }}{% endif %}
+        {%- elif _hco_cfg_warnings | length > 0 -%}
+        config otherwise sane, but {{ _hco_cfg_warnings | length }} risk(s) to review: {{ _hco_cfg_warnings | join('; ') }}
         {%- else -%}
         HyperConverged config sane: live migration enabled, workloadUpdateMethods includes LiveMigrate, {{ 'defaultCPUModel=' ~ _default_cpu_model if _default_cpu_model != '' else 'single/no node CPU model diversity detected' }}
         {%- endif -%}
@@ -113,6 +127,7 @@
         node_cpu_models: "{{ _node_cpu_models }}"
         permitted_host_devices: "{{ _permitted_host_devices }}"
         problems: "{{ _hco_cfg_problems }}"
+        warnings: "{{ _hco_cfg_warnings }}"
 
 - name: "check_hco_config_sanity | Record result"
   ansible.builtin.set_fact:

@@ -88,6 +88,7 @@
 - name: "check_mtu_consistency | Reset accumulators"
   ansible.builtin.set_fact:
     _mtu_problems: []
+    _mtu_warnings: []
     _mtu_bond_entries: []
     _mtu_vlan_entries: []
     _mtu_node_bonds: {}
@@ -119,14 +120,22 @@
     label: "{{ item.0.metadata.name }}/{{ item.1.name }}"
   when: (item.1.type == 'vlan') and (item.1.vlan is defined) and (item.1.vlan['base-iface'] is defined)
 
-- name: "check_mtu_consistency | Flag cross-node MTU mismatches per bond name"
+- name: "check_mtu_consistency | Flag cross-node MTU mismatches per bond name (WARNING, not CRITICAL)"
+  # NOTE: a bond reporting a different MTU across peer nodes is a
+  # difference worth a human reviewing (e.g. confirm it is intentional,
+  # watch for migration-time fragmentation) - it is not, by itself,
+  # evidence that anything is currently broken. Contrast with the
+  # parent/child ceiling violation below, which IS an active
+  # misconfiguration (a VLAN's own configured MTU exceeding its own
+  # parent bond's actual MTU causes real packet loss/fragmentation on
+  # that one node right now) - that one stays CRITICAL.
   vars:
     _entries_for_bond: "{{ _mtu_bond_entries | selectattr('bond', 'equalto', item) | list }}"
     _mtus_for_bond: "{{ _entries_for_bond | map(attribute='mtu') | unique | list }}"
   ansible.builtin.set_fact:
-    _mtu_problems: >-
+    _mtu_warnings: >-
       {{
-        _mtu_problems + ['bond ' ~ item ~ ' reports different MTUs across nodes: ' ~ (
+        _mtu_warnings + ['bond ' ~ item ~ ' reports different MTUs across nodes: ' ~ (
           _entries_for_bond | map(attribute='node') | list | zip(_entries_for_bond | map(attribute='mtu') | list)
           | map('join', '=') | list | join(', ')
         )]
@@ -207,10 +216,17 @@
     _mtu_consistency_result:
       check: check_mtu_consistency
       status: >-
-        {{ 'CRITICAL' if (_mtu_problems | length > 0) else 'OK' }}
+        {{
+          'CRITICAL' if (_mtu_problems | length > 0) else
+          'WARNING' if (_mtu_warnings | length > 0) else
+          'OK'
+        }}
       message: >-
         {%- if _mtu_problems | length > 0 -%}
-        {{ _mtu_problems | length }} MTU problems found: {{ _mtu_problems | join('; ') }}
+        {{ _mtu_problems | length }} MTU problem(s) found: {{ _mtu_problems | join('; ') }}
+        {%- if _mtu_warnings | length > 0 %}; also, cross-node MTU differences to review: {{ _mtu_warnings | join('; ') }}{% endif %}
+        {%- elif _mtu_warnings | length > 0 -%}
+        no VLAN or NAD exceeds its parent bond MTU, but {{ _mtu_warnings | length }} cross-node MTU difference(s) to review: {{ _mtu_warnings | join('; ') }}
         {%- else -%}
         MTU consistent across all nodes/bonds, no VLAN or NAD exceeds its parent bond MTU
         {%- endif -%}
@@ -219,6 +235,7 @@
         bond_entries: "{{ _mtu_bond_entries }}"
         trident_storageclass_count: "{{ _trident_sc_count }}"
         problems: "{{ _mtu_problems }}"
+        warnings: "{{ _mtu_warnings }}"
 
 - name: "check_mtu_consistency | Record result"
   ansible.builtin.set_fact:

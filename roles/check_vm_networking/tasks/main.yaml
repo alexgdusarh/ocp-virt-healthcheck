@@ -67,7 +67,8 @@
     _nncp_problems: []
     _node_nics: []
     _nic_signature_counts: {}
-    _nic_mismatch_nodes: []
+    _nic_debug_failures: []
+    _nic_inventory_diffs: []
 
 # --- 1. NMState operator ------------------------------------------------
 
@@ -143,24 +144,31 @@
   loop_control:
     label: "{{ item }}"
 
-- name: "check_vm_networking | Flag nodes whose NIC set differs from their role's reference, or whose debug failed"
+- name: "check_vm_networking | Flag nodes where oc debug itself failed (CRITICAL - can't verify NICs at all)"
+  ansible.builtin.set_fact:
+    _nic_debug_failures: "{{ _nic_debug_failures + [item.node ~ ' (oc debug failed - could not read NICs)'] }}"
+  loop: "{{ _node_nics }}"
+  loop_control:
+    label: "{{ item.node }}"
+  when: item.debug_failed
+
+- name: "check_vm_networking | Flag nodes whose NIC set differs from their role's reference (WARNING, not CRITICAL)"
+  # NOTE: a different NIC/bond inventory across nodes of the same role is
+  # NOT inherently broken - heterogeneous hardware (e.g. a node with an
+  # extra bond/NIC for a different purpose, or mid-rollout NNCP changes)
+  # is common and legitimate. This is a risk worth a human glancing at
+  # (confirm the difference is intentional), not a failure on its own -
+  # the thing that actually must match across nodes is whether the
+  # UDN/CUDN -> NAD chain resolves correctly everywhere (see check 22/25).
   vars:
     _my_sig: "{{ item.nics | join(',') }}"
     _ref_sig: "{{ (_reference_sig_by_role | default({}))[item.role] | default('') }}"
   ansible.builtin.set_fact:
-    _nic_mismatch_nodes: >-
-      {{
-        _nic_mismatch_nodes + [
-          item.node ~ (
-            ' (oc debug failed - could not read NICs)' if item.debug_failed else
-            ' (nics=' ~ _my_sig ~ ', role ' ~ item.role ~ ' reference=' ~ _ref_sig ~ ')'
-          )
-        ]
-      }}
-  loop: "{{ _node_nics }}"
+    _nic_inventory_diffs: "{{ _nic_inventory_diffs + [item.node ~ ' (nics=' ~ _my_sig ~ ', role ' ~ item.role ~ ' reference=' ~ _ref_sig ~ ')'] }}"
+  loop: "{{ _node_nics | rejectattr('debug_failed', 'equalto', true) | list }}"
   loop_control:
     label: "{{ item.node }}"
-  when: item.debug_failed or _my_sig != _ref_sig
+  when: _my_sig != _ref_sig
 
 # --- 4. Dedicated/secondary networks (NNCP interfaces, excluding br-ex) -
 
@@ -234,25 +242,29 @@
   vars:
     _nmstate_present: "{{ (_nmstate_csv | default({}) | length) > 0 }}"
     _nmstate_phase: "{{ _nmstate_csv.status.phase | default('NotFound') }}"
-    _total_problems: >-
+    _critical_count: >-
       {{
-        (_nncp_problems | length | int) + (_nic_mismatch_nodes | length | int)
+        (_nncp_problems | length | int) + (_nic_debug_failures | length | int)
         + (_vmi_missing_nad_refs | length | int)
       }}
+    _warning_count: "{{ _nic_inventory_diffs | length | int }}"
   ansible.builtin.set_fact:
     _vm_networking_result:
       check: check_vm_networking
       status: >-
         {{
-          'CRITICAL' if (_total_problems | int > 0) else
+          'CRITICAL' if (_critical_count | int > 0) else
+          'WARNING' if (_warning_count | int > 0) else
           'OK'
         }}
       message: >-
-        {%- if _total_problems | int > 0 -%}
-        {{ _total_problems }} problem(s) found
+        {%- if _critical_count | int > 0 -%}
+        {{ _critical_count }} problem(s) found
         {%- if _nncp_problems | length > 0 %}; NNCPs not healthy: {{ _nncp_problems | join(', ') }}{% endif %}
-        {%- if _nic_mismatch_nodes | length > 0 %}; NIC mismatches: {{ _nic_mismatch_nodes | join('; ') }}{% endif %}
+        {%- if _nic_debug_failures | length > 0 %}; could not read NICs: {{ _nic_debug_failures | join('; ') }}{% endif %}
         {%- if _vmi_missing_nad_refs | length > 0 %}; VMIs referencing missing NADs: {{ _vmi_missing_nad_refs | join('; ') }}{% endif %}
+        {%- elif _warning_count | int > 0 -%}
+        networking otherwise healthy, but {{ _warning_count }} node(s) have a different NIC/bond inventory than their role's reference (may be intentional on heterogeneous hardware - review): {{ _nic_inventory_diffs | join('; ') }}
         {%- else -%}
         networking healthy: NMState {{ 'installed (' ~ _nmstate_phase ~ ')' if _nmstate_present else 'not installed (optional)' }}, {{ _nncp.resources | default([]) | length }} NNCP(s) healthy, NICs consistent per role, {{ _nad_existing_refs | length }} NAD(s) all VMI references resolve
         {%- endif -%}
@@ -261,7 +273,8 @@
         nmstate_phase: "{{ _nmstate_phase }}"
         nncp_problems: "{{ _nncp_problems }}"
         node_nics: "{{ _node_nics }}"
-        nic_mismatch_nodes: "{{ _nic_mismatch_nodes }}"
+        nic_debug_failures: "{{ _nic_debug_failures }}"
+        nic_inventory_diffs: "{{ _nic_inventory_diffs }}"
         dedicated_networks: "{{ _dedicated_networks }}"
         nad_count: "{{ _nad_existing_refs | length }}"
         vmi_missing_nad_refs: "{{ _vmi_missing_nad_refs }}"
