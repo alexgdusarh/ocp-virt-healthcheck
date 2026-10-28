@@ -1,5 +1,10 @@
 # Install with: ansible-galaxy collection install -r requirements.yaml
 # Install ansible-core from requirements.txt first.
+# Pinned to what's actually installed and tested against in the
+# ansible-ocp pyenv virtualenv (confirmed: `ansible-galaxy collection
+# list` shows 2.2.3 resolved for this project, ahead of any newer
+# version installed globally in ~/.ansible/collections - Ansible
+# resolves the venv-local copy first).
 collections:
   - name: kubernetes.core
-    version: ">=3.0.0"
+    version: ">=2.2.3"

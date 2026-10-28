@@ -1,8 +1,12 @@
 # Install into a virtualenv (see README "Requirements"):
 #   pip install -r requirements.txt
-# ansible-core 2.16+ (needs Python 3.10+) is what current kubernetes.core
-# releases officially support.
-ansible-core>=2.16
+# Pinned to what this project is actually built and tested against
+# (the ansible-ocp pyenv virtualenv): ansible-core 2.12.10, Python
+# 3.10. Every role's Jinja/filter logic in this repo has been
+# verified on this exact combo - see the per-check gotchas called
+# out in role comments (e.g. check_node_vm_readiness, check_cdi_storage)
+# before assuming a newer ansible-core changes any of that behavior.
+ansible-core>=2.12
 jinja2>=3.1
 kubernetes>=27.2.0
 websocket-client>=1.6.0

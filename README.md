@@ -132,6 +132,7 @@ deterministic selection.
 | 22 | VLAN trunk reconciliation for a dedicated bonded uplink carrying many VLANs/NADs (optional - pass `vlan_trunk_bond`) | `oc-commands/22_check_vlan_trunk_reconciliation.sh` | `roles/check_vlan_trunk_reconciliation` |
 | 23 | CNV internal certificates (TLS handshake / trust diagnostics for virt-handler) | `oc-commands/23_check_cnv_certs.sh` | `roles/check_cnv_certs` |
 | 24 | Orphaned PersistentVolumeClaims (CDI-managed PVC with no owner, or owning DataVolume/VirtualMachine deleted) | `oc-commands/24_check_orphaned_pvcs.sh` | `roles/check_orphaned_pvcs` |
+| 25 | MTU consistency across NNCP/NNS (bond/bridge/VLAN) and the VM/UDN networks riding on top | `oc-commands/25_check_mtu_consistency.sh` | `roles/check_mtu_consistency` |
 
 MTV is the component that migrates VMs INTO OpenShift Virtualization
 from external sources (vSphere, oVirt/RHV, OpenStack, OVA) - a separate
@@ -176,27 +177,52 @@ accounts are bound to — it is not something anyone edits directly, so a
 drifted PSA label is a symptom of an upstream SCC/RBAC change, not the
 thing to fix in isolation.
 
-Check 22 is for topologies with one dedicated bonded uplink (e.g.
-active-backup) trunking many VLANs, each exposed via its own NAD — the
-scale check 11's basic VLAN cross-check doesn't target (seen in practice:
-one bond, 59 VLANs, 59 NADs). It requires `vlan_trunk_bond` to be set
-(there's no reliable way to auto-detect "the" dedicated VM-traffic bond
-generically) and is skipped (PASS, not FAIL) otherwise:
+Check 22 auto-detects which of two VLAN provisioning mechanisms a
+cluster uses and runs the matching checks — no flag needed on either:
 
-```bash
-ansible-playbook -i inventory/hosts.yaml site.yaml \
-  --tags check_vlan_trunk_reconciliation -e vlan_trunk_bond=bond0
+- **Mechanism A** (dedicated bonded uplink, e.g. active-backup,
+  trunking many VLANs via NMState, each exposed via a manually-created
+  NAD — seen in practice: one bond, 59 VLANs, 59 NADs; too coarse a
+  scale for check 11's basic VLAN cross-check). Only runs when
+  `vlan_trunk_bond` is set (there's no reliable way to auto-detect
+  "the" dedicated VM-traffic bond generically) **and** no
+  ClusterUserDefinedNetworks exist; skipped (PASS, not FAIL) otherwise:
 
-BOND_NAME=bond0 ./oc-commands/22_check_vlan_trunk_reconciliation.sh
-```
+  ```bash
+  ansible-playbook -i inventory/hosts.yaml site.yaml \
+    --tags check_vlan_trunk_reconciliation -e vlan_trunk_bond=bond0
 
-NMState has **no trunk-list field** at the bond/bridge level (verified
-from upstream source) — "is VLAN X trunked" is answered by enumerating
-NNCP-managed `type: vlan` sub-interfaces whose `vlan.base-iface` matches
-the bond, not by reading a single field. Bond member link-state field
-names are not stable across NMState versions, so this check reports
-raw NodeNetworkState data for manual reading rather than parsing an
-unconfirmed field.
+  BOND_NAME=bond0 ./oc-commands/22_check_vlan_trunk_reconciliation.sh
+  ```
+
+  NMState has **no trunk-list field** at the bond/bridge level
+  (verified from upstream source) — "is VLAN X trunked" is answered by
+  enumerating NNCP-managed `type: vlan` sub-interfaces whose
+  `vlan.base-iface` matches the bond, not by reading a single field.
+  Bond member link-state field names are not stable across NMState
+  versions, so this check reports raw NodeNetworkState data for manual
+  reading rather than parsing an unconfirmed field.
+
+- **Mechanism B** (OVN-Kubernetes `ClusterUserDefinedNetwork`, localnet
+  topology — the CUDN owns and generates its own NAD directly, Red
+  Hat's documented preferred method for VLAN connectivity since OCP
+  4.19). Runs automatically whenever any `ClusterUserDefinedNetwork`
+  exists — no flag or var needed:
+
+  ```bash
+  ansible-playbook -i inventory/hosts.yaml site.yaml \
+    --tags check_vlan_trunk_reconciliation
+
+  ./oc-commands/22_check_vlan_trunk_reconciliation.sh
+  ```
+
+  Verifies duplicate VLAN IDs within the same `physicalNetworkName`
+  (reuse across *different* `physicalNetworkName` values is normal,
+  not flagged), CUDNs whose `NetworkCreated` status condition isn't
+  `True`, CUDNs whose `namespaceSelector` matches zero namespaces (oc
+  script only — no built-in Ansible/Jinja Kubernetes label-selector
+  matcher), a per-CUDN UDN↔NAD reconciliation table (OK/ORPHAN), and
+  the reverse check (a UDN-labeled NAD with no owning CUDN).
 
 Check 23 targets virt-handler TLS handshake investigations specifically.
 KubeVirt runs its own self-signed CA (not cert-manager) in Secrets under
@@ -234,6 +260,25 @@ sharper signal is a PVC whose `ownerReferences` names a DataVolume or
 VirtualMachine that no longer exists — on a `Retain`-reclaim-policy
 StorageClass (flagged separately when present), that PVC/PV is not
 auto-cleaned when its owner is deleted, so orphans accumulate silently.
+
+Check 25 verifies MTU consistency end-to-end: cross-node consistency
+per bond name, parent/child MTU ceiling violations (a VLAN must not
+exceed its parent bond's actual MTU), and — for clusters using
+mechanism B above — each UDN/CUDN NAD's `mtu` against the actual bond
+it rides on, resolved via the real `physicalNetworkName` →
+`ovn.bridge-mappings` (on `NodeNetworkState`) → NNCP
+`ovs-bridge.bridge.port[].name` chain, not by guessing from the
+`physicalNetworkName` string itself (e.g. `"phys-bond1"` does not
+formally mean the bond is literally named `bond1`). It also flags, as
+an **informational note only** (not a FAIL), when Trident
+StorageClasses exist and the storage bond isn't running jumbo frames
+(MTU 9000) per NetApp's documented best practice — 1500 still works,
+it just leaves throughput on the table; switch-side MTU can't be
+checked from inside the cluster and must be confirmed separately. The
+Ansible role deliberately does not compare NNCP-*declared* MTU against
+NNS-*actual* MTU — NMState's `mtu` field is optional per-interface, and
+omitting it means "use the kernel default" (1500), not "drift"; only
+the oc-script prints both side by side for human review.
 
 Checks 13/14 are mutually exclusive in Ansible: `site.yaml`'s `pre_tasks`
 detect the cluster's actual CNI (CiliumNode CRD presence as the primary
