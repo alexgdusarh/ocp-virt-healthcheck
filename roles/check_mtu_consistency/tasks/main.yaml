@@ -1,0 +1,229 @@
+---
+# Check: MTU consistency across NNCP (physical NIC/bond/bridge), NNS
+# (actual live state), and the VM/storage networks riding on top
+#
+# See oc-commands/25_check_mtu_consistency.sh for the full detail on
+# what was verified against real must-gather data (bond0 default
+# cluster/NMState-unmanaged, bond1 VM network, bond2 storage network,
+# OVS bridge mtu-reporting quirk, br-int overlay exclusion, NetApp
+# jumbo-frame best practice) - kept in one place rather than
+# duplicated here.
+#
+# This role covers:
+#   1. Cross-node MTU consistency per bond (same bond name should
+#      report the same actual MTU on every node)
+#   2. Parent/child MTU ceiling violations (VLAN mtu > its parent
+#      bond's actual mtu, checked per node since bond naming/MTU is
+#      per-node state)
+#   3. UDN/CUDN NAD mtu vs the actual bond it rides on, resolved via
+#      status.currentState.ovn.bridge-mappings (localnet -> bridge)
+#      cross-referenced with the NNCP's ovs-bridge.bridge.port[].name
+#      (bridge -> underlying bond) - verified against real data from
+#      a cluster using phys-bond1/phys-bond2 localnet names
+#   4. Informational note on Trident StorageClass presence vs jumbo
+#      frames (not enforced as FAIL - 1500 works, just underperforms
+#      per NetApp's documented best practice)
+#
+# Deliberately NOT included: NNCP-declared vs NNS-actual drift
+# detection. NMState's `mtu` field is optional per-interface and
+# omitting it does NOT mean "inherit parent" or "drift" - it means
+# "use the kernel default" (confirmed: every interface on the real
+# cluster reviewed had no NNCP mtu set, yet NNS correctly showed 1500
+# everywhere). Treating "NNCP mtu unset" as a mismatch against NNS's
+# always-present value would be a false positive on every normal
+# cluster, so this role only asserts on NNS-actual (ground truth) -
+# the full desired/actual side-by-side table stays an oc-script-only
+# capability (section 1 vs section 2 there), same split as check 20's
+# etcdctl.
+#
+# Uses plain ansible.builtin/Jinja only - this project declares only
+# the kubernetes.core collection (requirements.yaml), so no
+# community.general or other third-party filters are used here.
+
+- name: "check_mtu_consistency | Get NodeNetworkStates"
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ k8s_auth_kubeconfig | default(omit) }}"
+    api_token: "{{ k8s_auth_api_token | default(omit) }}"
+    api_version: nmstate.io/v1beta1
+    kind: NodeNetworkState
+  register: _mtu_nns
+  ignore_errors: true
+
+- name: "check_mtu_consistency | Get NodeNetworkConfigurationPolicies"
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ k8s_auth_kubeconfig | default(omit) }}"
+    api_token: "{{ k8s_auth_api_token | default(omit) }}"
+    api_version: nmstate.io/v1
+    kind: NodeNetworkConfigurationPolicy
+  register: _mtu_nncp
+  ignore_errors: true
+
+- name: "check_mtu_consistency | Get ClusterUserDefinedNetworks (for NAD mtu cross-check)"
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ k8s_auth_kubeconfig | default(omit) }}"
+    api_token: "{{ k8s_auth_api_token | default(omit) }}"
+    api_version: k8s.ovn.org/v1
+    kind: ClusterUserDefinedNetwork
+  register: _mtu_cudns
+  ignore_errors: true
+
+- name: "check_mtu_consistency | Get NetworkAttachmentDefinitions"
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ k8s_auth_kubeconfig | default(omit) }}"
+    api_token: "{{ k8s_auth_api_token | default(omit) }}"
+    api_version: k8s.cni.cncf.io/v1
+    kind: NetworkAttachmentDefinition
+  register: _mtu_nads
+  ignore_errors: true
+
+- name: "check_mtu_consistency | Get StorageClasses (for the Trident/jumbo-frame informational note)"
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ k8s_auth_kubeconfig | default(omit) }}"
+    api_token: "{{ k8s_auth_api_token | default(omit) }}"
+    api_version: storage.k8s.io/v1
+    kind: StorageClass
+  register: _mtu_storageclasses
+  ignore_errors: true
+
+- name: "check_mtu_consistency | Reset accumulators"
+  ansible.builtin.set_fact:
+    _mtu_problems: []
+    _mtu_bond_entries: []
+    _mtu_vlan_entries: []
+    _mtu_node_bonds: {}
+
+- name: "check_mtu_consistency | Collect bond entries per node (and a per-node bond->mtu map)"
+  # NOTE: see the comment on the VLAN-entries task below - a loop-item value
+  # templated through "{{ item.1.mtu | default(None) }}" becomes the STRING
+  # '' when absent, never real Jinja None, because Ansible stringifies loop
+  # vars before they reach the dict literal. Absence is '' everywhere in
+  # this file, not None - every downstream check compares against ''.
+  ansible.builtin.set_fact:
+    _mtu_bond_entries: "{{ _mtu_bond_entries + [{'node': item.0.metadata.name, 'bond': item.1.name, 'mtu': (item.1.mtu | default('', true))}] }}"
+    _mtu_node_bonds: "{{ _mtu_node_bonds | combine({item.0.metadata.name: ((_mtu_node_bonds[item.0.metadata.name] | default({})) | combine({item.1.name: (item.1.mtu | default('', true))}))}) }}"
+  loop: "{{ (_mtu_nns.resources | default([])) | subelements('status.currentState.interfaces', skip_missing=True) }}"
+  loop_control:
+    label: "{{ item.0.metadata.name }}/{{ item.1.name }}"
+  when: item.1.type == 'bond'
+
+- name: "check_mtu_consistency | Collect VLAN entries per node (for parent/child ceiling check)"
+  # NOTE: a loop-item value passed through "{{ item.1.mtu | default(None) }}" is
+  # rendered to a STRING by Ansible's templating before it reaches the dict
+  # literal - default(None) then yields '' (empty string), never real Jinja
+  # None (verified: `is none` is False on it). So absence is represented as
+  # '' here, and every later comparison checks against '' rather than `is none`.
+  ansible.builtin.set_fact:
+    _mtu_vlan_entries: "{{ _mtu_vlan_entries + [{'node': item.0.metadata.name, 'vlan_name': item.1.name, 'mtu': (item.1.mtu | default('', true)), 'base_iface': (item.1.vlan['base-iface'] | default('', true))}] }}"
+  loop: "{{ (_mtu_nns.resources | default([])) | subelements('status.currentState.interfaces', skip_missing=True) }}"
+  loop_control:
+    label: "{{ item.0.metadata.name }}/{{ item.1.name }}"
+  when: (item.1.type == 'vlan') and (item.1.vlan is defined) and (item.1.vlan['base-iface'] is defined)
+
+- name: "check_mtu_consistency | Flag cross-node MTU mismatches per bond name"
+  vars:
+    _entries_for_bond: "{{ _mtu_bond_entries | selectattr('bond', 'equalto', item) | list }}"
+    _mtus_for_bond: "{{ _entries_for_bond | map(attribute='mtu') | unique | list }}"
+  ansible.builtin.set_fact:
+    _mtu_problems: >-
+      {{
+        _mtu_problems + ['bond ' ~ item ~ ' reports different MTUs across nodes: ' ~ (
+          _entries_for_bond | map(attribute='node') | list | zip(_entries_for_bond | map(attribute='mtu') | list)
+          | map('join', '=') | list | join(', ')
+        )]
+      }}
+  loop: "{{ _mtu_bond_entries | map(attribute='bond') | unique | list }}"
+  loop_control:
+    label: "{{ item }}"
+  when: (_mtus_for_bond | length) > 1
+
+- name: "check_mtu_consistency | Flag parent/child MTU ceiling violations"
+  vars:
+    _node_bond_map: "{{ _mtu_node_bonds[item.node] | default({}) }}"
+    _has_parent_mtu: "{{ (item.base_iface in _node_bond_map) and (_node_bond_map[item.base_iface] is not none) and (_node_bond_map[item.base_iface] != '') }}"
+  ansible.builtin.set_fact:
+    _mtu_problems: "{{ _mtu_problems + [item.node ~ ': VLAN ' ~ item.vlan_name ~ ' mtu=' ~ (item.mtu | string) ~ ' EXCEEDS parent ' ~ item.base_iface ~ ' mtu=' ~ (_node_bond_map[item.base_iface] | string)] }}"
+  loop: "{{ _mtu_vlan_entries }}"
+  loop_control:
+    label: "{{ item.node }}/{{ item.vlan_name }}"
+  when: >-
+    _has_parent_mtu and (item.mtu is defined) and (item.mtu != '')
+    and (item.mtu | int > _node_bond_map[item.base_iface] | int)
+
+- name: "check_mtu_consistency | Build bridge-mappings lookup (from node 1's NNS - the mapping is cluster-wide, not per-node-divergent)"
+  vars:
+    _node1: "{{ (_mtu_nns.resources | default([])) | first | default({}) }}"
+  ansible.builtin.set_fact:
+    _mtu_bridge_mappings: "{{ (_node1.status.currentState.ovn | default({}))['bridge-mappings'] | default([]) }}"
+    _mtu_node1_name: "{{ _node1.metadata.name | default('') }}"
+
+- name: "check_mtu_consistency | Reset bridge-port accumulator"
+  ansible.builtin.set_fact:
+    _mtu_bridge_ports: []
+
+- name: "check_mtu_consistency | Build bridge-port lookup (bridge name -> underlying bond/port name)"
+  vars:
+    _ports: "{{ item.1.bridge.port | default([]) | map(attribute='name') | list }}"
+  ansible.builtin.set_fact:
+    _mtu_bridge_ports: "{{ _mtu_bridge_ports + [{'bridge': item.1.name, 'port': (_ports[0] if (_ports | length > 0) else '')}] }}"
+  loop: "{{ (_mtu_nncp.resources | default([])) | subelements('spec.desiredState.interfaces', skip_missing=True) }}"
+  loop_control:
+    label: "{{ item.1.name }}"
+  when: item.1.type == 'ovs-bridge'
+
+- name: "check_mtu_consistency | Resolve each CUDN-managed NAD's underlying bond and compare MTU"
+  vars:
+    _config: "{{ item.spec.config | default('{}') | from_json }}"
+    _ns_name: "{{ item.metadata.namespace }}/{{ item.metadata.name }}"
+    _phys_net: "{{ _config.physicalNetworkName | default('') }}"
+    _bridges_found: "{{ _mtu_bridge_mappings | selectattr('localnet', 'equalto', _phys_net) | map(attribute='bridge') | list }}"
+    _bridge: "{{ _bridges_found[0] if (_bridges_found | length > 0) else '' }}"
+    _bonds_found: "{{ _mtu_bridge_ports | selectattr('bridge', 'equalto', _bridge) | map(attribute='port') | list }}"
+    _bond: "{{ _bonds_found[0] if (_bonds_found | length > 0) else '' }}"
+    _node1_bonds: "{{ _mtu_node_bonds[_mtu_node1_name] | default({}) }}"
+    _bond_has_mtu: "{{ (_bond != '') and (_bond in _node1_bonds) and (_node1_bonds[_bond] != '') }}"
+  ansible.builtin.set_fact:
+    _mtu_problems: >-
+      {{
+        _mtu_problems + [
+          (_ns_name ~ ': physicalNetworkName ' ~ _phys_net ~ ' has no bridge-mapping - cannot resolve underlying bond')
+          if (_bond == '')
+          else (_ns_name ~ ': NAD mtu=' ~ (_config.mtu | string) ~ ' EXCEEDS underlying bond ' ~ _bond ~ ' mtu=' ~ (_node1_bonds[_bond] | string))
+        ]
+      }}
+  loop: "{{ _mtu_nads.resources | default([]) }}"
+  loop_control:
+    label: "{{ item.metadata.name }}"
+  when: >-
+    (_mtu_cudns.resources | default([]) | length > 0)
+    and (_config.physicalNetworkName is defined) and (_config.mtu is defined)
+    and ((_bond == '') or (_bond_has_mtu and (_config.mtu | int > _node1_bonds[_bond] | int)))
+
+- name: "check_mtu_consistency | Finalize result"
+  vars:
+    _trident_sc_count: "{{ (_mtu_storageclasses.resources | default([])) | selectattr('provisioner', 'equalto', 'csi.trident.netapp.io') | list | length }}"
+    _trident_note: >-
+      NOTE: {{ _trident_sc_count }} Trident StorageClass(es) found - confirm with the storage team whether end-to-end jumbo frames (MTU 9000) were intended for the storage bond, per NetApp documented best practice (not enforced as a failure here; switch-side MTU is not visible from inside the cluster).
+  ansible.builtin.set_fact:
+    _mtu_consistency_result:
+      check: check_mtu_consistency
+      status: >-
+        {{ 'FAIL' if (_mtu_problems | length > 0) else 'PASS' }}
+      message: >-
+        {%- if _mtu_problems | length > 0 -%}
+        {{ _mtu_problems | length }} MTU problems found: {{ _mtu_problems | join('; ') }}
+        {%- else -%}
+        MTU consistent across all nodes/bonds, no VLAN or NAD exceeds its parent bond MTU
+        {%- endif -%}
+        {{ (' ' ~ _trident_note) if (_trident_sc_count | int > 0) else '' }}
+      data:
+        bond_entries: "{{ _mtu_bond_entries }}"
+        trident_storageclass_count: "{{ _trident_sc_count }}"
+        problems: "{{ _mtu_problems }}"
+
+- name: "check_mtu_consistency | Record result"
+  ansible.builtin.set_fact:
+    healthcheck_results: "{{ healthcheck_results + [_mtu_consistency_result] }}"
+
+- name: "check_mtu_consistency | Show result"
+  ansible.builtin.debug:
+    var: _mtu_consistency_result
