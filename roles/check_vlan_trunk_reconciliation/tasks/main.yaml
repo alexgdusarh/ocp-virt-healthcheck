@@ -1,44 +1,169 @@
 ---
 # Check: VLAN trunk reconciliation (dedicated bond, many VLANs/NADs)
 #
-# For topologies with one bonded uplink trunking many VLANs (seen:
-# one active-backup bond, 59 VLANs, 59 NADs) - validates at a scale
-# check_vm_networking's basic VLAN cross-check doesn't target.
+# Two distinct VLAN provisioning mechanisms are both seen in the
+# field; this role auto-detects which one a cluster uses by checking
+# for ClusterUserDefinedNetwork (CUDN) resources - see
+# oc-commands/22_check_vlan_trunk_reconciliation.sh for full detail on
+# both (that script is where the verified-against-real-must-gather
+# comments live, kept in one place rather than duplicated):
 #
-# Key fact (researched, verified): NMState has NO trunk-list field at
-# the bond/bridge level. The "trunk" is whatever set of NNCP-managed
-# type:vlan sub-interfaces (vlan.base-iface == <bond>, vlan.id == N)
-# actually exist - that set IS the trunk, built by enumeration here,
-# not looked up from a single field.
+#  (A) NMState/NNCP-managed VLAN sub-interfaces on a dedicated bond,
+#      manually-created NADs. Requires `vlan_trunk_bond` to be set
+#      (-e vlan_trunk_bond=bond0) - no reliable way to auto-detect
+#      "the" dedicated VM-traffic bond generically, so mechanism A is
+#      skipped (not failed) when neither CUDNs exist nor the var is
+#      provided.
 #
-# Requires `vlan_trunk_bond` to be set (-e vlan_trunk_bond=bond0) -
-# there is no reliable way to auto-detect "the" dedicated VM-traffic
-# bond generically across different fleet topologies, so this check
-# is skipped (not failed) when the var isn't provided.
+#  (B) OVN-Kubernetes ClusterUserDefinedNetwork (CUDN), localnet
+#      topology - the CUDN owns and generates its own NAD. Verified
+#      against real must-gather data (62 real NADs/CUDNs, 2 physical
+#      networks phys-bond1/phys-bond2) - auto-detected, no var needed.
 #
 # Bond member link-state field names are NOT stable across NMState
-# versions (researched, medium confidence only) - this check does not
-# parse/assert a specific field name for member status; it only
+# versions (researched, medium confidence only) - mechanism A does
+# not parse/assert a specific field name for member status; it only
 # reports whether NodeNetworkState data exists for the bond per node,
 # leaving human reading of the raw link-aggregation status to the
 # oc-script companion.
 
-- name: "check_vlan_trunk_reconciliation | Skip if vlan_trunk_bond not provided"
+- name: "check_vlan_trunk_reconciliation | Detect ClusterUserDefinedNetworks (mechanism B)"
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ k8s_auth_kubeconfig | default(omit) }}"
+    api_token: "{{ k8s_auth_api_token | default(omit) }}"
+    api_version: k8s.ovn.org/v1
+    kind: ClusterUserDefinedNetwork
+  register: _vt_cudns
+  ignore_errors: true
+
+- name: "check_vlan_trunk_reconciliation | Skip if no CUDNs and vlan_trunk_bond not provided"
   ansible.builtin.set_fact:
     _vlan_trunk_result:
       check: check_vlan_trunk_reconciliation
       status: PASS
-      message: "Skipped: vlan_trunk_bond not set (pass -e vlan_trunk_bond=<bond-name> to enable this check)"
+      message: "Skipped: no ClusterUserDefinedNetworks found and vlan_trunk_bond not set (pass -e vlan_trunk_bond=<bond-name> for the NMState/NNCP trunk-based mechanism)"
       data: {}
-  when: vlan_trunk_bond is not defined
+  when: >-
+    (_vt_cudns.resources | default([]) | length == 0)
+    and (vlan_trunk_bond is not defined)
 
 - name: "check_vlan_trunk_reconciliation | Record skip result"
   ansible.builtin.set_fact:
     healthcheck_results: "{{ healthcheck_results + [_vlan_trunk_result] }}"
-  when: vlan_trunk_bond is not defined
+  when: >-
+    (_vt_cudns.resources | default([]) | length == 0)
+    and (vlan_trunk_bond is not defined)
 
-- name: "check_vlan_trunk_reconciliation | Run real checks"
-  when: vlan_trunk_bond is defined
+- name: "check_vlan_trunk_reconciliation | Run mechanism B (CUDN/UDN) checks"
+  when: _vt_cudns.resources | default([]) | length > 0
+  block:
+    - name: "check_vlan_trunk_reconciliation | Get NetworkAttachmentDefinitions (all namespaces)"
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ k8s_auth_kubeconfig | default(omit) }}"
+        api_token: "{{ k8s_auth_api_token | default(omit) }}"
+        api_version: k8s.cni.cncf.io/v1
+        kind: NetworkAttachmentDefinition
+      register: _vt_b_nads
+      ignore_errors: true
+
+    - name: "check_vlan_trunk_reconciliation | Reset mechanism B accumulators"
+      ansible.builtin.set_fact:
+        _vt_b_problems: []
+        _vt_b_reconciliation: []
+
+    - name: "check_vlan_trunk_reconciliation | Extract each NAD's vlanID/physicalNetworkName/owner"
+      vars:
+        _config: "{{ item.spec.config | default('{}') | from_json }}"
+      ansible.builtin.set_fact:
+        _vt_b_nad_info: "{{ (_vt_b_nad_info | default([])) + [{'ref': item.metadata.namespace ~ '/' ~ item.metadata.name, 'ns': item.metadata.namespace, 'name': item.metadata.name, 'vlan': _config.vlanID, 'phys': _config.physicalNetworkName, 'owner': (item.metadata.ownerReferences | default([]) | map(attribute='name') | first | default('')), 'owner_kind': (item.metadata.ownerReferences | default([]) | map(attribute='kind') | first | default('')), 'udn_labeled': ('k8s.ovn.org/user-defined-network' in (item.metadata.labels | default({})))}] }}"
+      loop: "{{ _vt_b_nads.resources | default([]) }}"
+      loop_control:
+        label: "{{ item.metadata.name }}"
+      ignore_errors: true
+
+    - name: "check_vlan_trunk_reconciliation | Flag duplicate VLAN IDs within the same physicalNetworkName"
+      vars:
+        _key: "{{ item.phys }}/{{ item.vlan }}"
+        _matches: "{{ (_vt_b_nad_info | default([])) | selectattr('phys', 'equalto', item.phys) | selectattr('vlan', 'equalto', item.vlan) | map(attribute='ref') | list }}"
+      ansible.builtin.set_fact:
+        _vt_b_problems: "{{ _vt_b_problems + ['physicalNetworkName ' ~ item.phys ~ ', VLAN ' ~ item.vlan ~ ' used by: ' ~ (_matches | join(', '))] }}"
+      loop: "{{ (_vt_b_nad_info | default([])) | unique(attribute='ref') | list }}"
+      loop_control:
+        label: "{{ item.ref }}"
+        index_var: _idx
+      when: >-
+        (item.vlan is not none) and (item.phys is not none)
+        and (_matches | length > 1)
+        and (_matches | first) == item.ref
+
+    - name: "check_vlan_trunk_reconciliation | Flag CUDNs where NetworkCreated status is NOT True"
+      vars:
+        _nc_condition: "{{ (item.status.conditions | default([])) | selectattr('type', 'equalto', 'NetworkCreated') | first | default({}) }}"
+      ansible.builtin.set_fact:
+        _vt_b_problems: "{{ _vt_b_problems + [item.metadata.name ~ ': NetworkCreated=' ~ (_nc_condition.status | default('MISSING')) ~ ' (' ~ (_nc_condition.message | default('no condition found')) ~ ')'] }}"
+      loop: "{{ _vt_cudns.resources | default([]) }}"
+      loop_control:
+        label: "{{ item.metadata.name }}"
+      when: (_nc_condition.status | default('Unknown')) != 'True'
+
+    # NOTE: "CUDN whose namespaceSelector matches zero namespaces" is
+    # deliberately NOT checked here - Ansible/Jinja has no built-in
+    # Kubernetes label-selector matcher (matchExpressions operators
+    # In/NotIn/Exists/DoesNotExist combined with matchLabels), and
+    # hand-rolling one is exactly the kind of reinvented wheel the
+    # project avoids. The oc-script companion
+    # (22_check_vlan_trunk_reconciliation.sh, section 3) implements
+    # and verifies this signal instead.
+
+    - name: "check_vlan_trunk_reconciliation | Build UDN <-> NAD reconciliation table"
+      vars:
+        _owned: "{{ (_vt_b_nad_info | default([])) | selectattr('owner', 'equalto', item.metadata.name) | list }}"
+      ansible.builtin.set_fact:
+        _vt_b_reconciliation: "{{ _vt_b_reconciliation + [{'cudn': item.metadata.name, 'status': 'OK', 'nad': _owned[0].ref} if (_owned | length > 0) else {'cudn': item.metadata.name, 'status': 'ORPHAN', 'nad': none}] }}"
+      loop: "{{ _vt_cudns.resources | default([]) }}"
+      loop_control:
+        label: "{{ item.metadata.name }}"
+
+    - name: "check_vlan_trunk_reconciliation | Flag orphaned NADs (UDN-labeled, no owning CUDN)"
+      ansible.builtin.set_fact:
+        _vt_b_problems: "{{ _vt_b_problems + [item.ref ~ ': ORPHAN (UDN label present, no owning ClusterUserDefinedNetwork)'] }}"
+      loop: "{{ (_vt_b_nad_info | default([])) | selectattr('udn_labeled', 'equalto', true) | list }}"
+      loop_control:
+        label: "{{ item.ref }}"
+      when: item.owner_kind != 'ClusterUserDefinedNetwork'
+
+    - name: "check_vlan_trunk_reconciliation | Finalize mechanism B result"
+      ansible.builtin.set_fact:
+        _vlan_trunk_result:
+          check: check_vlan_trunk_reconciliation
+          status: >-
+            {{ 'FAIL' if (_vt_b_problems | length > 0) else 'PASS' }}
+          message: >-
+            {%- if _vt_b_problems | length > 0 -%}
+            {{ _vt_b_problems | length }} problem(s) found (CUDN/UDN mechanism): {{ _vt_b_problems | join('; ') }}
+            {%- else -%}
+            {{ _vt_cudns.resources | default([]) | length }} ClusterUserDefinedNetwork(s), all reconciled with their NAD, no duplicate VLANs within any physicalNetworkName
+            {%- endif -%}
+            {{ ' NOTE: namespaceSelector-matches-zero-namespaces check is NOT evaluated here (no equivalent of jq label-selector matching in this role) - run the oc-script companion for that signal.' }}
+          data:
+            mechanism: udn_cudn
+            cudn_count: "{{ _vt_cudns.resources | default([]) | length }}"
+            nad_count: "{{ _vt_b_nad_info | default([]) | length }}"
+            reconciliation: "{{ _vt_b_reconciliation }}"
+            problems: "{{ _vt_b_problems }}"
+
+    - name: "check_vlan_trunk_reconciliation | Record mechanism B result"
+      ansible.builtin.set_fact:
+        healthcheck_results: "{{ healthcheck_results + [_vlan_trunk_result] }}"
+
+    - name: "check_vlan_trunk_reconciliation | Show mechanism B result"
+      ansible.builtin.debug:
+        var: _vlan_trunk_result
+
+- name: "check_vlan_trunk_reconciliation | Run mechanism A (NMState/NNCP bond trunk) checks"
+  when: >-
+    (_vt_cudns.resources | default([]) | length == 0)
+    and (vlan_trunk_bond is defined)
   block:
     - name: "check_vlan_trunk_reconciliation | Get NetworkAttachmentDefinitions (all namespaces)"
       kubernetes.core.k8s_info:
