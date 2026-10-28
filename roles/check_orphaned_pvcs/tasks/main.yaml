@@ -97,19 +97,57 @@
     (_vm_owner | length > 0)
     and (_owner_ref not in _existing_vm_refs)
 
+- name: "check_orphaned_pvcs | Reset PVC tally accumulators"
+  ansible.builtin.set_fact:
+    _tally_cdi_managed: []
+    _tally_unowned_non_cdi: []
+    _tally_owned_non_cdi: []
+
+- name: "check_orphaned_pvcs | Tally: CDI-managed PVCs"
+  # NOTE: deliberately NOT using selectattr() with a dotted attribute-path
+  # string here - a Kubernetes label key that itself contains dots
+  # (app.kubernetes.io/managed-by) makes selectattr('metadata.labels.app.
+  # kubernetes.io/managed-by', ...) try to traverse app -> kubernetes ->
+  # io/managed-by as NESTED attributes, which silently returns an empty
+  # list (no error) rather than reading the one flat dict key - verified
+  # by reproducing this exact bug against real must-gather-shaped data.
+  # The project's own proven-safe idiom (used elsewhere in this same
+  # file, e.g. the orphan-detection tasks above) is bracket access on
+  # the loop's own `item` directly inside `when:`.
+  ansible.builtin.set_fact:
+    _tally_cdi_managed: "{{ _tally_cdi_managed + [item.metadata.namespace ~ '/' ~ item.metadata.name] }}"
+  loop: "{{ _op_pvcs.resources | default([]) }}"
+  loop_control:
+    label: "{{ item.metadata.name }}"
+  when: >-
+    ((item.metadata.labels | default({}))['app.kubernetes.io/managed-by'] | default('')) == 'cdi-controller'
+
+- name: "check_orphaned_pvcs | Tally: unowned, non-CDI PVCs (e.g. registry/backup storage - normal)"
+  ansible.builtin.set_fact:
+    _tally_unowned_non_cdi: "{{ _tally_unowned_non_cdi + [item.metadata.namespace ~ '/' ~ item.metadata.name] }}"
+  loop: "{{ _op_pvcs.resources | default([]) }}"
+  loop_control:
+    label: "{{ item.metadata.name }}"
+  when: >-
+    (((item.metadata.labels | default({}))['app.kubernetes.io/managed-by'] | default('')) != 'cdi-controller')
+    and (item.metadata.ownerReferences | default([]) | length == 0)
+
+- name: "check_orphaned_pvcs | Tally: owned, non-CDI PVCs"
+  ansible.builtin.set_fact:
+    _tally_owned_non_cdi: "{{ _tally_owned_non_cdi + [item.metadata.namespace ~ '/' ~ item.metadata.name] }}"
+  loop: "{{ _op_pvcs.resources | default([]) }}"
+  loop_control:
+    label: "{{ item.metadata.name }}"
+  when: >-
+    (((item.metadata.labels | default({}))['app.kubernetes.io/managed-by'] | default('')) != 'cdi-controller')
+    and (item.metadata.ownerReferences | default([]) | length > 0)
+
 - name: "check_orphaned_pvcs | Build per-category PVC tally (documents what was checked, not just problems)"
-  vars:
-    _all_pvcs: "{{ _op_pvcs.resources | default([]) }}"
-    _cdi_pvcs: "{{ _all_pvcs | selectattr('metadata.labels', 'defined') | selectattr('metadata.labels.app.kubernetes.io/managed-by', 'defined') | selectattr('metadata.labels.app.kubernetes.io/managed-by', 'equalto', 'cdi-controller') | list }}"
-    _cdi_names: "{{ _cdi_pvcs | map(attribute='metadata.name') | list }}"
-    _non_cdi_pvcs: "{{ _all_pvcs | rejectattr('metadata.name', 'in', _cdi_names) | list }}"
-    _unowned_non_cdi: "{{ _non_cdi_pvcs | selectattr('metadata.ownerReferences', 'undefined') | list + _non_cdi_pvcs | selectattr('metadata.ownerReferences', 'defined') | selectattr('metadata.ownerReferences', 'equalto', []) | list }}"
-    _owned_non_cdi: "{{ _non_cdi_pvcs | rejectattr('metadata.name', 'in', (_unowned_non_cdi | map(attribute='metadata.name') | list)) | list }}"
   ansible.builtin.set_fact:
     _pvc_tally:
-      cdi_managed: "{{ _cdi_pvcs | map(attribute='metadata.namespace') | zip(_cdi_pvcs | map(attribute='metadata.name')) | map('join', '/') | list }}"
-      unowned_non_cdi: "{{ _unowned_non_cdi | map(attribute='metadata.namespace') | zip(_unowned_non_cdi | map(attribute='metadata.name')) | map('join', '/') | list }}"
-      owned_non_cdi: "{{ _owned_non_cdi | map(attribute='metadata.namespace') | zip(_owned_non_cdi | map(attribute='metadata.name')) | map('join', '/') | list }}"
+      cdi_managed: "{{ _tally_cdi_managed }}"
+      unowned_non_cdi: "{{ _tally_unowned_non_cdi }}"
+      owned_non_cdi: "{{ _tally_owned_non_cdi }}"
 
 - name: "check_orphaned_pvcs | Finalize result"
   vars:
