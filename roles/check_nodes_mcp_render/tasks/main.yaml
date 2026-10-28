@@ -66,6 +66,19 @@
     label: "{{ item.metadata.name }}"
 
 - name: "check_nodes_mcp_render | Flag nodes not matching their pool's rendered config"
+  # NOTE: a node must match the rendered config of AT LEAST ONE pool it
+  # belongs to, not ALL of them. A combined-role node (e.g. compact/
+  # SNO-adjacent clusters where every node is control-plane,master,
+  # worker) legitimately belongs to BOTH the master and worker MCPs,
+  # but MCO only ever actually renders it against ONE pool at a time
+  # (master wins priority over worker). Requiring a match against
+  # every pool a node belongs to false-positives on every node in
+  # this very common topology - verified against a real playbook run
+  # where all 3 nodes on a compact cluster were wrongly flagged despite
+  # current_config == desired_config == the master pool's rendered
+  # config (the node also matched worker's label selector, so its
+  # current_config correctly did NOT match worker's DIFFERENT rendered
+  # config - that is expected, not a problem).
   ansible.builtin.set_fact:
     _node_render_problems: "{{ _node_render_problems + [item.node ~ ' (pools: ' ~ (item.pools | join(',') if item.pools | length > 0 else 'NONE') ~ ')'] }}"
   loop: "{{ _node_render_summary }}"
@@ -74,7 +87,7 @@
   when: >-
     item.current_config != item.desired_config
     or item.pools | length == 0
-    or item.pool_rendered_configs | reject('equalto', item.current_config) | list | length > 0
+    or item.current_config not in item.pool_rendered_configs
 
 - name: "check_nodes_mcp_render | Finalize result"
   ansible.builtin.set_fact:
