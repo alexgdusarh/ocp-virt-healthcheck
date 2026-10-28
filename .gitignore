@@ -1,4 +1,10 @@
-reports/*.json
+# Generated reports of any format - never commit, contains real client data
+reports/*
+!reports/.gitkeep
+
+# Raw oc-command/bash output saved locally for report-building - real client data
+bash-outputs/
+
 *.kubeconfig
 kubeconfig*
 .vault_pass
@@ -6,6 +12,12 @@ kubeconfig*
 
 # Internal-use template, not for the public repo
 docs/General_Formal_document_template.docx
+
+# Report generator (confidential - planned to move to a separate private
+# project later; never committed here, whatever its eventual filename/path)
+report-generator/
+generate-report*
+render-report*
 
 # Client must-gather data: 100% confidential, never commit/share
 mg/
