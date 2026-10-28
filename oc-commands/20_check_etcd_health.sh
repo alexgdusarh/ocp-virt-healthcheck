@@ -57,7 +57,7 @@ echo "# binary itself says to use metrics/dashboards instead (confirmed"
 echo "# live). etcd's documented SLO: p99 wal_fsync_duration_seconds < 10ms,"
 echo "# p99 backend_commit_duration_seconds < 25ms - this is the real latency"
 echo "# etcd has actually been experiencing under production load."
-TOKEN=$(oc create token prometheus-k8s -n openshift-monitoring --duration=5m 2>/dev/null || true)
+TOKEN=$(oc create token prometheus-k8s -n openshift-monitoring --duration=10m 2>/dev/null || true)
 THANOS_HOST=$(oc get route thanos-querier -n openshift-monitoring -o jsonpath='{.spec.host}' 2>/dev/null || true)
 if [ -n "$TOKEN" ] && [ -n "$THANOS_HOST" ]; then
   for METRIC in etcd_disk_wal_fsync_duration_seconds_bucket etcd_disk_backend_commit_duration_seconds_bucket; do
