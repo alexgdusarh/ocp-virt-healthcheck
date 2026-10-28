@@ -116,9 +116,9 @@
       check: check_kubevirt_components
       status: >-
         {{
-          'FAIL' if (not _kv_present) else
-          'FAIL' if (_total_problems | int > 0) else
-          'PASS'
+          'CRITICAL' if (not _kv_present) else
+          'CRITICAL' if (_total_problems | int > 0) else
+          'OK'
         }}
       message: >-
         {%- if not _kv_present -%}

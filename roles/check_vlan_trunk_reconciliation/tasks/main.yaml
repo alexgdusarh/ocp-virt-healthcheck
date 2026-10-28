@@ -40,7 +40,7 @@
   ansible.builtin.set_fact:
     _vlan_trunk_result:
       check: check_vlan_trunk_reconciliation
-      status: PASS
+      status: OK
       message: "Skipped: no ClusterUserDefinedNetworks found and vlan_trunk_bond not set (pass -e vlan_trunk_bond=<bond-name> for the NMState/NNCP trunk-based mechanism)"
       data: {}
   when: >-
@@ -137,7 +137,7 @@
         _vlan_trunk_result:
           check: check_vlan_trunk_reconciliation
           status: >-
-            {{ 'FAIL' if (_vt_b_problems | length > 0) else 'PASS' }}
+            {{ 'CRITICAL' if (_vt_b_problems | length > 0) else 'OK' }}
           message: >-
             {%- if _vt_b_problems | length > 0 -%}
             {{ _vt_b_problems | length }} problem(s) found (CUDN/UDN mechanism): {{ _vt_b_problems | join('; ') }}
@@ -262,7 +262,7 @@
         _vlan_trunk_result:
           check: check_vlan_trunk_reconciliation
           status: >-
-            {{ 'FAIL' if (_total_problems | int > 0) else 'PASS' }}
+            {{ 'CRITICAL' if (_total_problems | int > 0) else 'OK' }}
           message: >-
             {%- if _total_problems | int > 0 -%}
             {{ _total_problems }} problem(s) found on bond {{ vlan_trunk_bond }}

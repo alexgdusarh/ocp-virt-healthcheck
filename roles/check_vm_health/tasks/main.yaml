@@ -66,8 +66,8 @@
       check: check_vm_health
       status: >-
         {{
-          'FAIL' if (_problem_count | int > 0) else
-          'PASS'
+          'CRITICAL' if (_problem_count | int > 0) else
+          'OK'
         }}
       message: >-
         {%- if (_vm_count | int) == 0 -%}

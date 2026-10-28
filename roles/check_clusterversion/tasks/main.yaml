@@ -40,11 +40,11 @@
       check: check_clusterversion
       status: >-
         {{
-          'FAIL' if (_cv.resources | default([]) | length == 0) else
-          'FAIL' if (_degraded | length > 0 or _failing | length > 0) else
+          'CRITICAL' if (_cv.resources | default([]) | length == 0) else
+          'CRITICAL' if (_degraded | length > 0 or _failing | length > 0) else
           'WARN' if (_feature_set != '') else
           'WARN' if (_available | length == 0) else
-          'PASS'
+          'OK'
         }}
       message: >-
         {%- if _cv.resources | default([]) | length == 0 -%}

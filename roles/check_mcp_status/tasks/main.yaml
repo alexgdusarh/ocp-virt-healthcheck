@@ -51,9 +51,9 @@
       check: check_mcp_status
       status: >-
         {{
-          'FAIL' if (_mcp.resources | default([]) | length == 0) else
-          'FAIL' if (_mcp_problem_pools | length > 0) else
-          'PASS'
+          'CRITICAL' if (_mcp.resources | default([]) | length == 0) else
+          'CRITICAL' if (_mcp_problem_pools | length > 0) else
+          'OK'
         }}
       message: >-
         {%- if _mcp.resources | default([]) | length == 0 -%}

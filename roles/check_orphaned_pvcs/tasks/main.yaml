@@ -156,7 +156,7 @@
     _orphaned_pvcs_result:
       check: check_orphaned_pvcs
       status: >-
-        {{ 'FAIL' if (_orphan_pvc_problems | length > 0) else 'PASS' }}
+        {{ 'CRITICAL' if (_orphan_pvc_problems | length > 0) else 'OK' }}
       message: >-
         {%- if _orphan_pvc_problems | length > 0 -%}
         {{ _orphan_pvc_problems | length }} orphaned PVC(s) found: {{ _orphan_pvc_problems | join('; ') }}

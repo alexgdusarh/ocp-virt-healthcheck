@@ -108,9 +108,9 @@
       check: check_cdi_storage
       status: >-
         {{
-          'FAIL' if ((_sc_count | int) == 0 or not _cdi_present) else
-          'FAIL' if (_total_problems | int > 0) else
-          'PASS'
+          'CRITICAL' if ((_sc_count | int) == 0 or not _cdi_present) else
+          'CRITICAL' if (_total_problems | int > 0) else
+          'OK'
         }}
       message: >-
         {%- if (_sc_count | int) == 0 -%}

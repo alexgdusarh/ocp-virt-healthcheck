@@ -73,9 +73,9 @@
       check: check_hco_status
       status: >-
         {{
-          'FAIL' if (not _hco_present or _csv_phase != 'Succeeded') else
-          'FAIL' if (_hco_condition_problems | length > 0) else
-          'PASS'
+          'CRITICAL' if (not _hco_present or _csv_phase != 'Succeeded') else
+          'CRITICAL' if (_hco_condition_problems | length > 0) else
+          'OK'
         }}
       message: >-
         {%- if not _hco_present -%}

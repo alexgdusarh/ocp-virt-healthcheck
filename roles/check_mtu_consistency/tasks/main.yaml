@@ -207,7 +207,7 @@
     _mtu_consistency_result:
       check: check_mtu_consistency
       status: >-
-        {{ 'FAIL' if (_mtu_problems | length > 0) else 'PASS' }}
+        {{ 'CRITICAL' if (_mtu_problems | length > 0) else 'OK' }}
       message: >-
         {%- if _mtu_problems | length > 0 -%}
         {{ _mtu_problems | length }} MTU problems found: {{ _mtu_problems | join('; ') }}

@@ -78,8 +78,8 @@
       check: check_machinesets
       status: >-
         {{
-          'FAIL' if (_machineset_problems | length > 0 or _machine_problems | length > 0) else
-          'PASS'
+          'CRITICAL' if (_machineset_problems | length > 0 or _machine_problems | length > 0) else
+          'OK'
         }}
       message: >-
         {%- if _api_unavailable -%}

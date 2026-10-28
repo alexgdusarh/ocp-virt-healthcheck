@@ -51,9 +51,9 @@
       check: check_clusteroperators
       status: >-
         {{
-          'FAIL' if (_co.resources | default([]) | length == 0) else
-          'FAIL' if (_unhealthy_names | length > 0) else
-          'PASS'
+          'CRITICAL' if (_co.resources | default([]) | length == 0) else
+          'CRITICAL' if (_unhealthy_names | length > 0) else
+          'OK'
         }}
       message: >-
         {%- if _co.resources | default([]) | length == 0 -%}

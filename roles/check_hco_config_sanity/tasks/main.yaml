@@ -99,7 +99,7 @@
     _hco_config_sanity_result:
       check: check_hco_config_sanity
       status: >-
-        {{ 'FAIL' if (_hco_cfg_problems | length > 0) else 'PASS' }}
+        {{ 'CRITICAL' if (_hco_cfg_problems | length > 0) else 'OK' }}
       message: >-
         {%- if _hco_cfg_problems | length > 0 -%}
         {{ _hco_cfg_problems | length }} config issue(s) found: {{ _hco_cfg_problems | join('; ') }}

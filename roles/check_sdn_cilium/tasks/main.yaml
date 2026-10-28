@@ -144,8 +144,8 @@
       check: check_sdn_cilium
       status: >-
         {{
-          'FAIL' if (_total_problems | int > 0) else
-          'PASS'
+          'CRITICAL' if (_total_problems | int > 0) else
+          'OK'
         }}
       message: >-
         {%- if _total_problems | int > 0 -%}

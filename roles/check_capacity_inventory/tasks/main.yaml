@@ -92,7 +92,7 @@
       status: >-
         {{
           'WARN' if ((_schedulable_node_count | int) == 0) else
-          'PASS'
+          'OK'
         }}
       message: >-
         {%- if (_schedulable_node_count | int) == 0 -%}

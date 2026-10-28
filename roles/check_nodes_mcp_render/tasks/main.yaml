@@ -95,9 +95,9 @@
       check: check_nodes_mcp_render
       status: >-
         {{
-          'FAIL' if (_nodes.resources | default([]) | length == 0 or _mcp.resources | default([]) | length == 0) else
-          'FAIL' if (_node_render_problems | length > 0) else
-          'PASS'
+          'CRITICAL' if (_nodes.resources | default([]) | length == 0 or _mcp.resources | default([]) | length == 0) else
+          'CRITICAL' if (_node_render_problems | length > 0) else
+          'OK'
         }}
       message: >-
         {%- if _nodes.resources | default([]) | length == 0 or _mcp.resources | default([]) | length == 0 -%}

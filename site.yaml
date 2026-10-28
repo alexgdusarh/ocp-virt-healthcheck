@@ -6,9 +6,12 @@
 # KUBECONFIG to check another cluster in the fleet.
 #
 # Each check is its own role under roles/check_*, selectable by tag.
-# Every role appends its result (PASS/FAIL/WARN + data) to the
-# healthcheck_results list; the final play writes that list to a
-# per-cluster JSON report and prints the PASS/FAIL/WARN summary.
+# Every role appends its result (status: OK/INFO/WARNING/CRITICAL +
+# data) to the healthcheck_results list; the final play writes that
+# list to a per-cluster JSON report and prints the summary. Severity
+# vocabulary matches the sibling ocp_preupgrade_health_check project
+# (OK=healthy, INFO=notable but not a risk, WARNING=a real risk worth
+# review but not currently broken, CRITICAL=genuinely broken/degraded).
 #
 # Usage:
 #   KUBECONFIG=/path/to/cluster.kubeconfig ansible-playbook site.yaml

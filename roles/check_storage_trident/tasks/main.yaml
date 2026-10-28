@@ -34,7 +34,7 @@
       ansible.builtin.set_fact:
         _storage_trident_result:
           check: check_storage_trident
-          status: PASS
+          status: OK
           message: "Trident CRDs not present - Trident is not installed on this cluster"
           data: {}
 
@@ -184,7 +184,7 @@
         _storage_trident_result:
           check: check_storage_trident
           status: >-
-            {{ 'FAIL' if (_trident_problems | length > 0) else 'PASS' }}
+            {{ 'CRITICAL' if (_trident_problems | length > 0) else 'OK' }}
           message: >-
             {%- if _trident_problems | length > 0 -%}
             {{ _trident_problems | length }} problem(s) found: {{ _trident_problems | join('; ') }}

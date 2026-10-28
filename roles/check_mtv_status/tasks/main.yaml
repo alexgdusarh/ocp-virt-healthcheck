@@ -31,7 +31,7 @@
       ansible.builtin.set_fact:
         _mtv_status_result:
           check: check_mtv_status
-          status: PASS
+          status: OK
           message: "forklift.konveyor.io CRDs not present - MTV is not installed on this cluster"
           data: {}
 
@@ -164,7 +164,7 @@
         _mtv_status_result:
           check: check_mtv_status
           status: >-
-            {{ 'FAIL' if (_mtv_problems | length > 0) else 'PASS' }}
+            {{ 'CRITICAL' if (_mtv_problems | length > 0) else 'OK' }}
           message: >-
             {%- if _mtv_problems | length > 0 -%}
             {{ _mtv_problems | length }} problem(s) found: {{ _mtv_problems | join('; ') }}
